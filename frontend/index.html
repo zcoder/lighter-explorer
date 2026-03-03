@@ -3,48 +3,66 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Lighter Perps Dashboard</title>
+  <title>Lighter Explorer</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <header>
-    <h1>Lighter Perps Dashboard</h1>
+    <h1 id="app-title">Lighter Explorer</h1>
+    <div class="header-info">
+      <div class="header-chip" id="block-chip" title="Current blockchain height">
+        <span class="chip-icon">&#x25A3;</span>
+        <span class="chip-label">Block</span>
+        <span class="chip-value" id="block-height">&mdash;</span>
+      </div>
+      <div class="header-chip ws-chip" id="ws-status">
+        <span class="ws-dot" id="ws-dot"></span>
+        <span class="chip-value" id="ws-status-text">Disconnected</span>
+      </div>
+    </div>
   </header>
 
   <main>
-    <!-- L1 address form -->
+    <!-- Search form -->
     <section class="card">
       <form id="address-form">
-        <label for="l1-input">L1 Address</label>
+        <label for="l1-input">Search</label>
         <div class="form-row">
           <input
             id="l1-input"
             type="text"
-            placeholder="0x..."
+            placeholder="0x... or account ID"
             spellcheck="false"
             autocomplete="off"
             list="l1-history"
           />
           <datalist id="l1-history"></datalist>
-          <button type="submit">Load Accounts</button>
+          <button type="submit">Search</button>
         </div>
       </form>
     </section>
 
-    <!-- Main account card -->
+    <!-- Main account card (L1 search) -->
     <section id="main-account" class="card hidden">
-      <h2>Main Account <span class="badge badge-type">type 0</span></h2>
+      <h2>Main Account <span class="badge badge-type">Main</span></h2>
       <div class="account-grid">
         <div class="field"><span class="label">Index</span><span id="ma-index" class="value mono">—</span></div>
         <div class="field"><span class="label">Status</span><span id="ma-status" class="value">—</span></div>
+        <div class="field"><span class="label">Total Asset Value</span><span id="ma-total-asset" class="value">—</span></div>
         <div class="field"><span class="label">Collateral</span><span id="ma-collateral" class="value">—</span></div>
         <div class="field"><span class="label">Available Balance</span><span id="ma-balance" class="value">—</span></div>
         <div class="field"><span class="label">Trading Mode</span><span id="ma-mode" class="value">—</span></div>
         <div class="field"><span class="label">Total Orders</span><span id="ma-orders" class="value">—</span></div>
         <div class="field"><span class="label">Pending Orders</span><span id="ma-pending" class="value">—</span></div>
-        <div class="field"><span class="label">Subs In Position</span><span id="ma-active-subs" class="value">—</span></div>
-        <div class="field"><span class="label">L1 Address</span><span id="ma-l1" class="value mono">—</span></div>
+        <div class="field"><span class="label">Trading Subs</span><span id="ma-active-subs" class="value">—</span></div>
+        <div class="field"><span class="label">Users Online</span><span id="ma-online" class="value">—</span></div>
       </div>
+    </section>
+
+    <!-- Single account card (ID search) -->
+    <section id="single-account" class="card hidden">
+      <h2 id="sa-header"></h2>
+      <div id="sa-content"></div>
     </section>
 
     <!-- Sub-accounts table -->
@@ -58,7 +76,7 @@
               <input type="checkbox" id="filter-balance" /> With balance
             </label>
             <label class="checkbox-label">
-              <input type="checkbox" id="filter-activated" /> In position
+              <input type="checkbox" id="filter-activated" /> No positions
             </label>
             <label class="checkbox-label">
               <input type="checkbox" id="filter-zero-pos" /> Show zero positions
@@ -71,9 +89,8 @@
           <thead>
             <tr>
               <th class="sortable" data-key="index">Index</th>
-              <th class="sortable" data-key="status">Status</th>
-              <th class="sortable" data-key="collateral">Collateral</th>
-              <th class="sortable" data-key="available_balance">Available Balance</th>
+              <th class="sortable" data-key="_accountStatus">Status</th>
+              <th class="sortable" data-key="total_asset_value">Total Asset Value</th>
               <th class="sortable" data-key="account_trading_mode">Trading Mode</th>
               <th class="sortable" data-key="total_order_count">Total Orders</th>
               <th class="sortable" data-key="pending_order_count">Pending</th>
@@ -86,10 +103,13 @@
     </section>
 
     <!-- Loading / error states -->
-    <div id="loading" class="hidden"><div class="spinner"></div>Loading accounts...</div>
+    <div id="loading" class="hidden"><div class="spinner"></div>Loading...</div>
     <div id="error" class="hidden"></div>
   </main>
 
+  <div id="toast-container"></div>
+
+  <script src="/ws.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

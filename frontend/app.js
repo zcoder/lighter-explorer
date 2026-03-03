@@ -12,23 +12,61 @@
   const noResults = document.getElementById("no-results");
   const loadingEl = document.getElementById("loading");
   const errorEl = document.getElementById("error");
+  const toastContainer = document.getElementById("toast-container");
+  const singleAccountSection = document.getElementById("single-account");
+  const appTitle = document.getElementById("app-title");
 
   let allSubAccounts = [];
-  let expandedIndex = null;   // currently expanded sub-account index
-  let expandedData = null;    // cached detail response for expanded row
-  let expandedColSpan = 7;    // column count
-  let sortKey = null;         // current sort column key
-  let sortAsc = true;         // sort direction
+  let expandedIndexes = new Set();  // set of expanded sub-account indexes (strings)
+  let expandedColSpan = 6;    // column count
+  let sortKey = "_accountStatus";  // default sort: by account status
+  let sortAsc = false;        // descending so accounts with positions come first
+
+  // ── Market data from WebSocket ─────────────────────────
+  let marketData = {};
+  let marketRenderTimer = null;
+
+  // ── WS polling (request/response, not streaming) ───────
+  let mainAccountObj = null;
+  let singleAccountData = null;
+  let masterTrackId = null;        // main account ID being polled
+  let singleTrackId = null;        // single account ID being polled
+  let trackedSubs = {};            // { index: timerId } — expanded subs, each with own timer
+  let masterPollTimer = null;
+  let singlePollTimer = null;
+  const POLL_INTERVAL = 5000;
 
   // ── Helpers ──────────────────────────────────────────────
 
   function show(el) { el.classList.remove("hidden"); }
   function hide(el) { el.classList.add("hidden"); }
 
-  function statusBadge(status) {
-    // status: 1 = has open positions, 0 = no positions
-    const hasPositions = status === 1;
-    return `<span class="badge ${hasPositions ? "badge-active" : "badge-inactive"}">${hasPositions ? "In position" : "No positions"}</span>`;
+  // ── 3-state account status: trading / idle / need to check ──
+
+  function getAccountStatus(acc) {
+    var hasBal = hasBalance(acc);
+    var hasPos = acc._hasPositions === true;
+    if (hasBal && hasPos) return "trading";
+    if (hasBal && !hasPos) return "check";
+    return "idle";
+  }
+
+  function accountStatusBadge(acc, skipCheck) {
+    var st = getAccountStatus(acc);
+    if (st === "trading") {
+      return '<span class="badge badge-trading" title="Has balance and open positions">Trading</span>';
+    }
+    if (st === "check" && !skipCheck) {
+      return '<span class="badge badge-check" title="Has balance but no open positions — review recommended">Need to check</span>';
+    }
+    return '<span class="badge badge-idle" title="No open positions">Idle</span>';
+  }
+
+  function onlineBadge(acc) {
+    if (acc.status === 1) {
+      return ' <span class="badge badge-online" title="Account is active on the network">online</span>';
+    }
+    return "";
   }
 
   function tradingMode(mode) {
@@ -40,10 +78,58 @@
     return val;
   }
 
+  function formatNumber(val, decimals) {
+    if (val === undefined || val === null || val === "") return "—";
+    var n = parseFloat(val);
+    if (isNaN(n)) return val;
+    return n.toFixed(decimals);
+  }
+
   function hasBalance(acc) {
     const col = parseFloat(acc.collateral);
     const bal = parseFloat(acc.available_balance);
     return (col > 0) || (bal > 0);
+  }
+
+  function hasRealPositions(detailData) {
+    const acc = detailData && detailData.accounts && detailData.accounts[0];
+    if (!acc || !acc.positions) return false;
+    return acc.positions.some((p) => parseFloat(p.position_value) !== 0);
+  }
+
+  // Convert WS positions object { market_index: Position } to flat array
+  function wsPositionsToArray(posObj) {
+    if (!posObj || typeof posObj !== "object") return [];
+    var result = [];
+    var keys = Object.keys(posObj);
+    for (var i = 0; i < keys.length; i++) {
+      var val = posObj[keys[i]];
+      if (Array.isArray(val)) {
+        for (var j = 0; j < val.length; j++) result.push(val[j]);
+      } else if (val && typeof val === "object") {
+        result.push(val);
+      }
+    }
+    return result;
+  }
+
+  function syncSubStatus(index, detailData) {
+    const hasPos = hasRealPositions(detailData);
+
+    // Update cached sub-account
+    const sub = allSubAccounts.find((a) => String(a.index) === String(index));
+    if (sub) {
+      sub._hasPositions = hasPos;
+    }
+
+    // Update the table row status cell (index 1)
+    const row = subTbody.querySelector('tr.sub-row[data-index="' + index + '"]');
+    if (row && sub) {
+      var statusCell = row.children[1];
+      if (statusCell) {
+        statusCell.innerHTML = accountStatusBadge(sub) + onlineBadge(sub);
+      }
+    }
   }
 
   function setField(id, html) {
@@ -56,122 +142,198 @@
     return "—";
   }
 
+  // ── Toast notifications ────────────────────────────────
+
+  function showToast(title, message, type) {
+    if (!type) type = "info";
+    const el = document.createElement("div");
+    el.className = "toast toast-" + type;
+    el.innerHTML =
+      '<div class="toast-body">' +
+        '<div class="toast-title">' + title + '</div>' +
+        '<div class="toast-message">' + message + '</div>' +
+      '</div>' +
+      '<button class="toast-close">&times;</button>';
+
+    el.querySelector(".toast-close").addEventListener("click", () => el.remove());
+    toastContainer.appendChild(el);
+
+    setTimeout(() => {
+      el.classList.add("toast-out");
+      el.addEventListener("animationend", () => el.remove());
+    }, 8000);
+
+    // Max 5 visible
+    while (toastContainer.children.length > 5) {
+      toastContainer.firstChild.remove();
+    }
+  }
+
   // ── Render main account ─────────────────────────────────
 
   function renderMainAccount(acc, subs) {
-    const activeSubs = subs.filter((s) => s.status === 1).length;
+    mainAccountObj = acc;
+    var tradingSubs = subs.filter(function (s) { return getAccountStatus(s) === "trading"; }).length;
+    var onlineSubs = subs.filter(function (s) { return s.status === 1; }).length;
+    // Determine main account positions
+    var mainRealPos = (acc.positions || []).filter((p) => parseFloat(p.position_value) !== 0);
+    acc._hasPositions = mainRealPos.length > 0;
     setField("ma-index", acc.index);
-    setField("ma-status", statusBadge(acc.status));
+    setField("ma-status", accountStatusBadge(acc, true) + onlineBadge(acc));
+    setField("ma-total-asset", formatNumber(acc.total_asset_value, 6));
     setField("ma-collateral", formatValue(acc.collateral));
     setField("ma-balance", formatValue(acc.available_balance));
     setField("ma-mode", tradingMode(acc.account_trading_mode));
     setField("ma-orders", acc.total_order_count);
     setField("ma-pending", acc.pending_order_count);
-    setField("ma-active-subs", `${activeSubs} / ${subs.length}`);
-    setField("ma-l1", acc.l1_address || "—");
+    setField("ma-active-subs", tradingSubs + " / " + subs.length);
+    setField("ma-online", onlineSubs);
     show(mainSection);
   }
 
-  // ── Render detail panel for expanded sub-account ────────
+  // ── Shared account content renderer ─────────────────────
 
-  function renderDetailRow(detail, colSpan) {
-    const acc = detail.accounts?.[0];
-    if (!acc) return `<tr class="detail-row"><td colspan="${colSpan}">No data</td></tr>`;
+  function renderAccountContent(acc, skipCheck) {
+    if (acc._hasPositions === undefined) {
+      acc._hasPositions = (acc.positions || []).some((p) => parseFloat(p.position_value) !== 0);
+    }
 
-    let positionsHtml = "";
+    var positionsHtml = "";
     const showZero = filterZeroPos.checked;
     const positions = showZero
       ? (acc.positions || [])
       : (acc.positions || []).filter((p) => parseFloat(p.position_value) !== 0);
+
     if (positions.length > 0) {
       const posRows = positions.map((p) => {
         const leverage = parseFloat(p.initial_margin_fraction) > 0
           ? Math.round(100 / parseFloat(p.initial_margin_fraction)) + "x"
           : "—";
-        return `<tr>
-          <td>${p.symbol}</td>
-          <td>${signLabel(p.sign)}</td>
-          <td>${leverage}</td>
-          <td>${p.position}</td>
-          <td>${p.avg_entry_price}</td>
-          <td>${p.position_value}</td>
-          <td class="${parseFloat(p.unrealized_pnl) >= 0 ? "pnl-positive" : "pnl-negative"}">${p.unrealized_pnl}</td>
-          <td class="${parseFloat(p.realized_pnl) >= 0 ? "pnl-positive" : "pnl-negative"}">${p.realized_pnl}</td>
-          <td>${p.open_order_count}</td>
-          <td>${p.liquidation_price === "0" ? "—" : p.liquidation_price}</td>
-        </tr>`;
+
+        const mkt = marketData[p.symbol] || {};
+        const markPrice = mkt.mark_price || "—";
+
+        var pnlVal = parseFloat(p.unrealized_pnl) || 0;
+
+        var isolatedBadge = p.margin_mode === 1
+          ? ' <span class="badge badge-isolated" title="Isolated margin · allocated ' + formatValue(p.allocated_margin) + '">Isolated</span>'
+          : '';
+
+        return '<tr>' +
+          '<td>' + p.symbol + isolatedBadge + '</td>' +
+          '<td>' + signLabel(p.sign) + '</td>' +
+          '<td>' + leverage + '</td>' +
+          '<td>' + p.position + '</td>' +
+          '<td>' + p.avg_entry_price + '</td>' +
+          '<td class="live-value">' + markPrice + '</td>' +
+          '<td>' + p.position_value + '</td>' +
+          '<td class="' + (pnlVal >= 0 ? "pnl-positive" : "pnl-negative") + '">' + p.unrealized_pnl + '</td>' +
+          '<td class="' + (parseFloat(p.realized_pnl) >= 0 ? "pnl-positive" : "pnl-negative") + '">' + p.realized_pnl + '</td>' +
+          '<td>' + p.open_order_count + '</td>' +
+          '<td>' + (p.liquidation_price === "0" ? "—" : p.liquidation_price) + '</td>' +
+        '</tr>';
       }).join("");
 
-      positionsHtml = `
-        <div class="detail-section">
-          <h4>Positions</h4>
-          <div class="table-wrap">
-            <table class="positions-table">
-              <thead>
-                <tr>
-                  <th>Market</th>
-                  <th>Side</th>
-                  <th>Leverage</th>
-                  <th>Size</th>
-                  <th>Avg Entry</th>
-                  <th>Value</th>
-                  <th>Unrealized PnL</th>
-                  <th>Realized PnL</th>
-                  <th>OOC</th>
-                  <th>Liq. Price</th>
-                </tr>
-              </thead>
-              <tbody>${posRows}</tbody>
-            </table>
-          </div>
-        </div>
-      `;
-    } else {
-      positionsHtml = '<div class="detail-section"><h4>Positions</h4><p class="detail-empty">No positions</p></div>';
+      positionsHtml =
+        '<div class="detail-section">' +
+          '<h4>Positions</h4>' +
+          '<div class="table-wrap">' +
+            '<table class="positions-table">' +
+              '<thead><tr>' +
+                '<th>Market</th>' +
+                '<th>Side</th>' +
+                '<th>Leverage</th>' +
+                '<th>Size</th>' +
+                '<th>Avg Entry</th>' +
+                '<th>Mark Price</th>' +
+                '<th>Value</th>' +
+                '<th>Unrealized PnL</th>' +
+                '<th>Realized PnL</th>' +
+                '<th>OOC</th>' +
+                '<th>Liq. Price</th>' +
+              '</tr></thead>' +
+              '<tbody>' + posRows + '</tbody>' +
+            '</table>' +
+          '</div>' +
+        '</div>';
     }
 
-    return `<tr class="detail-row"><td colspan="${colSpan}">
-      <div class="detail-panel">
-        <div class="detail-grid">
-          <div class="field"><span class="label">Collateral</span><span class="value">${formatValue(acc.collateral)}</span></div>
-          <div class="field"><span class="label">Available Balance</span><span class="value">${formatValue(acc.available_balance)}</span></div>
-          <div class="field"><span class="label">Total Asset Value</span><span class="value">${formatValue(acc.total_asset_value)}</span></div>
-          <div class="field"><span class="label">Cross Asset Value</span><span class="value">${formatValue(acc.cross_asset_value)}</span></div>
-          <div class="field"><span class="label">Trading Mode</span><span class="value">${tradingMode(acc.account_trading_mode)}</span></div>
-          <div class="field"><span class="label">Status</span><span class="value">${statusBadge(acc.status)}</span></div>
-        </div>
-        ${positionsHtml}
-      </div>
-    </td></tr>`;
+    var positionsField = positions.length > 0
+      ? '<div class="field"><span class="label">Positions</span><span class="value">' + positions.length + ' open</span></div>'
+      : '<div class="field"><span class="label">Positions</span><span class="value" style="color:var(--text-muted)">No positions</span></div>';
+
+    return '<div class="detail-grid">' +
+      '<div class="field"><span class="label">Total Asset Value</span><span class="value">' + formatNumber(acc.total_asset_value, 6) + '</span></div>' +
+      '<div class="field"><span class="label">Collateral</span><span class="value">' + formatValue(acc.collateral) + '</span></div>' +
+      '<div class="field"><span class="label">Available Balance</span><span class="value">' + formatValue(acc.available_balance) + '</span></div>' +
+      '<div class="field"><span class="label">Cross Asset Value</span><span class="value">' + formatValue(acc.cross_asset_value) + '</span></div>' +
+      '<div class="field"><span class="label">Trading Mode</span><span class="value">' + tradingMode(acc.account_trading_mode) + '</span></div>' +
+      '<div class="field"><span class="label">Status</span><span class="value">' + accountStatusBadge(acc, skipCheck) + onlineBadge(acc) + '</span></div>' +
+      positionsField +
+    '</div>' +
+    positionsHtml;
   }
 
-  // ── Collapse any open detail ────────────────────────────
+  // ── Render detail panel for expanded sub-account ────────
 
-  function collapseExpanded() {
-    const prev = subTbody.querySelector(".detail-row");
-    if (prev) prev.remove();
-    const prevActive = subTbody.querySelector("tr.expanded");
-    if (prevActive) prevActive.classList.remove("expanded");
-    expandedIndex = null;
-    expandedData = null;
+  function renderDetailRow(detail, colSpan, index) {
+    const acc = detail.accounts && detail.accounts[0];
+    var attr = index ? ' data-detail-for="' + index + '"' : '';
+    if (!acc) return '<tr class="detail-row"' + attr + '><td colspan="' + colSpan + '">No data</td></tr>';
+
+    return '<tr class="detail-row"' + attr + '><td colspan="' + colSpan + '">' +
+      '<div class="detail-panel">' + renderAccountContent(acc) + '</div>' +
+    '</td></tr>';
+  }
+
+  // ── Render single account card (ID search) ────────────
+
+  function renderSingleAccount(acc) {
+    if (acc._hasPositions === undefined) {
+      acc._hasPositions = (acc.positions || []).some((p) => parseFloat(p.position_value) !== 0);
+    }
+    var typeLabel = acc.account_type === 0 ? 'Main' : 'Sub';
+    var skipCheck = acc.account_type === 0;
+    document.getElementById("sa-header").innerHTML =
+      'Account #' + acc.index + ' ' +
+      '<span class="badge badge-type">' + typeLabel + '</span> ' +
+      accountStatusBadge(acc, skipCheck) + onlineBadge(acc);
+    document.getElementById("sa-content").innerHTML = renderAccountContent(acc, skipCheck);
+    show(singleAccountSection);
+  }
+
+  // ── Collapse helpers ────────────────────────────────────
+
+  function collapseRow(index) {
+    var detailRow = subTbody.querySelector('.detail-row[data-detail-for="' + index + '"]');
+    if (detailRow) detailRow.remove();
+    var subRow = subTbody.querySelector('tr.sub-row[data-index="' + index + '"]');
+    if (subRow) subRow.classList.remove("expanded");
+    expandedIndexes.delete(String(index));
+    unsubscribeSubAccount(index);
+  }
+
+  function collapseAllExpanded() {
+    subTbody.querySelectorAll(".detail-row").forEach(function (r) { r.remove(); });
+    subTbody.querySelectorAll("tr.expanded").forEach(function (r) { r.classList.remove("expanded"); });
+    expandedIndexes.clear();
   }
 
   // ── Render sub-accounts table ───────────────────────────
 
   function renderSubRow(acc) {
-    return `<tr class="sub-row" data-index="${acc.index}">
-      <td class="mono">${acc.index}</td>
-      <td>${statusBadge(acc.status)}</td>
-      <td>${formatValue(acc.collateral)}</td>
-      <td>${formatValue(acc.available_balance)}</td>
-      <td>${tradingMode(acc.account_trading_mode)}</td>
-      <td>${acc.total_order_count}</td>
-      <td>${acc.pending_order_count}</td>
-    </tr>`;
+    return '<tr class="sub-row" data-index="' + acc.index + '">' +
+      '<td class="mono">' + acc.index + '</td>' +
+      '<td>' + accountStatusBadge(acc) + onlineBadge(acc) + '</td>' +
+      '<td>' + formatNumber(acc.total_asset_value, 6) + '</td>' +
+      '<td>' + tradingMode(acc.account_trading_mode) + '</td>' +
+      '<td>' + acc.total_order_count + '</td>' +
+      '<td>' + acc.pending_order_count + '</td>' +
+    '</tr>';
   }
 
   function renderSubAccounts(accounts) {
-    expandedIndex = null;
+    expandedIndexes.clear();
     if (accounts.length === 0) {
       subTbody.innerHTML = "";
       show(noResults);
@@ -184,60 +346,73 @@
   // ── Click handler for sub-account rows ──────────────────
 
   subTbody.addEventListener("click", async (e) => {
+    // Ignore clicks inside detail panel — only collapse via sub-row click
+    if (e.target.closest(".detail-row")) return;
+
     const row = e.target.closest("tr.sub-row");
     if (!row) return;
 
     const index = row.dataset.index;
 
-    // If clicking the already-expanded row, collapse it
-    if (expandedIndex === index) {
-      collapseExpanded();
+    // If clicking an already-expanded row, collapse it
+    if (expandedIndexes.has(index)) {
+      collapseRow(index);
       return;
     }
 
-    // Collapse previous
-    collapseExpanded();
-
-    // Mark this row as expanded
-    expandedIndex = index;
-    expandedData = null;
+    // Expand this row (without collapsing others)
+    expandedIndexes.add(index);
     expandedColSpan = row.children.length;
     row.classList.add("expanded");
 
-    // Insert loading placeholder
     const colSpan = expandedColSpan;
-    const loadingRow = document.createElement("tr");
-    loadingRow.className = "detail-row";
-    loadingRow.innerHTML = `<td colspan="${colSpan}"><div class="detail-panel detail-loading"><div class="spinner"></div> Loading...</div></td>`;
-    row.after(loadingRow);
 
-    try {
-      const resp = await fetch(`/api/account?by=index&value=${encodeURIComponent(index)}`);
-      if (!resp.ok) throw new Error("Failed to load");
-      const data = await resp.json();
+    // Use cached detail from initial load if available
+    const sub = allSubAccounts.find((a) => String(a.index) === String(index));
+    if (sub && sub._cachedDetail) {
+      const detailHtml = renderDetailRow(sub._cachedDetail, colSpan, index);
+      const detailRow = document.createElement("tr");
+      detailRow.className = "detail-row-tmp";
+      row.after(detailRow);
+      detailRow.outerHTML = detailHtml;
 
-      // Check we're still expanded on the same index
-      if (expandedIndex !== index) return;
+      // Subscribe to live updates for this sub-account
+      subscribeSubAccount(index);
+    } else {
+      // Fallback: fetch detail if no cached data
+      const loadingRow = document.createElement("tr");
+      loadingRow.className = "detail-row";
+      loadingRow.setAttribute("data-detail-for", index);
+      loadingRow.innerHTML = '<td colspan="' + colSpan + '"><div class="detail-panel detail-loading"><div class="spinner"></div> Loading...</div></td>';
+      row.after(loadingRow);
 
-      expandedData = data;
-      loadingRow.outerHTML = renderDetailRow(data, colSpan);
-    } catch {
-      if (expandedIndex !== index) return;
-      loadingRow.innerHTML = `<td colspan="${colSpan}"><div class="detail-panel detail-error">Failed to load account details</div></td>`;
+      try {
+        const resp = await fetch("/api/account?by=index&value=" + encodeURIComponent(index));
+        if (!resp.ok) throw new Error("Failed to load");
+        const data = await resp.json();
+
+        if (!expandedIndexes.has(index)) return;
+
+        loadingRow.outerHTML = renderDetailRow(data, colSpan, index);
+        syncSubStatus(index, data);
+        subscribeSubAccount(index);
+      } catch (err) {
+        if (!expandedIndexes.has(index)) return;
+        loadingRow.innerHTML = '<td colspan="' + colSpan + '"><div class="detail-panel detail-error">Failed to load account details</div></td>';
+      }
     }
-  });
-
-  // ── Click outside table collapses detail ────────────────
-
-  document.addEventListener("click", (e) => {
-    if (expandedIndex === null) return;
-    if (e.target.closest("#sub-accounts")) return;
-    collapseExpanded();
   });
 
   // ── Sort logic ──────────────────────────────────────────
 
   function getSortValue(acc, key) {
+    // Account status sort: trading (2) > check (1) > idle (0)
+    if (key === "_accountStatus") {
+      var st = getAccountStatus(acc);
+      if (st === "trading") return 2;
+      if (st === "check") return 1;
+      return 0;
+    }
     const val = acc[key];
     if (val === undefined || val === null || val === "") return -Infinity;
     const num = Number(val);
@@ -252,7 +427,10 @@
       const vb = getSortValue(b, sortKey);
       if (va < vb) return sortAsc ? -1 : 1;
       if (va > vb) return sortAsc ? 1 : -1;
-      return 0;
+      // Secondary sort by total_asset_value descending
+      const ta = parseFloat(a.total_asset_value) || 0;
+      const tb = parseFloat(b.total_asset_value) || 0;
+      return tb - ta;
     });
     return sorted;
   }
@@ -296,7 +474,7 @@
       filtered = filtered.filter(hasBalance);
     }
     if (onlyActivated) {
-      filtered = filtered.filter((acc) => acc.status === 1);
+      filtered = filtered.filter((acc) => acc._hasPositions !== true);
     }
 
     filtered = sortAccounts(filtered);
@@ -307,13 +485,352 @@
   filterBalance.addEventListener("change", applyFilters);
   filterActivated.addEventListener("change", applyFilters);
 
-  // Re-render expanded detail row when "show zero positions" changes
+  // Re-render positions when "show zero positions" changes
   filterZeroPos.addEventListener("change", () => {
-    if (expandedIndex === null || !expandedData) return;
-    const detailRow = subTbody.querySelector(".detail-row");
-    if (detailRow) {
-      detailRow.outerHTML = renderDetailRow(expandedData, expandedColSpan);
+    // Re-render all expanded sub-account detail rows
+    expandedIndexes.forEach(function (idx) {
+      var sub = allSubAccounts.find(function (a) { return String(a.index) === idx; });
+      if (sub && sub._cachedDetail) {
+        var detailRow = subTbody.querySelector('.detail-row[data-detail-for="' + idx + '"]');
+        if (detailRow) {
+          detailRow.outerHTML = renderDetailRow(sub._cachedDetail, expandedColSpan, idx);
+        }
+      }
+    });
+    // Re-render single account view
+    if (singleAccountData && singleAccountData.accounts && singleAccountData.accounts[0]) {
+      var sa = singleAccountData.accounts[0];
+      var skipCheck = sa.account_type === 0;
+      document.getElementById("sa-content").innerHTML = renderAccountContent(sa, skipCheck);
     }
+  });
+
+  // ── WS polling — each account on its own timer ─────────
+
+  function refreshAccount(id) {
+    window.LighterWS.refresh("user_stats/" + id);
+    window.LighterWS.refresh("account_all/" + id);
+  }
+
+  // ── Master account ────────────────────────────────────────
+
+  function subscribeMasterAccount(accountIndex) {
+    unsubscribeMasterAccount();
+    masterTrackId = String(accountIndex);
+    window.LighterWS.subscribe("user_stats/" + masterTrackId, handleMainUserStats);
+    window.LighterWS.subscribe("account_all/" + masterTrackId, handleMainAccountAll);
+    masterPollTimer = setInterval(function () { refreshAccount(masterTrackId); }, POLL_INTERVAL);
+  }
+
+  function unsubscribeMasterAccount() {
+    if (!masterTrackId) return;
+    if (masterPollTimer) { clearInterval(masterPollTimer); masterPollTimer = null; }
+    window.LighterWS.unsubscribe("user_stats/" + masterTrackId);
+    window.LighterWS.unsubscribe("account_all/" + masterTrackId);
+    masterTrackId = null;
+  }
+
+  function applyUserStats(acc, s) {
+    if (s.portfolio_value !== undefined) acc.total_asset_value = s.portfolio_value;
+    if (s.collateral !== undefined) acc.collateral = s.collateral;
+    if (s.available_balance !== undefined) acc.available_balance = s.available_balance;
+    if (s.account_trading_mode !== undefined) acc.account_trading_mode = s.account_trading_mode;
+    if (s.cross_stats && s.cross_stats.portfolio_value !== undefined) {
+      acc.cross_asset_value = s.cross_stats.portfolio_value;
+    }
+  }
+
+  function handleMainUserStats(msg) {
+    if (!mainAccountObj || !msg.stats) return;
+    var s = msg.stats;
+    applyUserStats(mainAccountObj, s);
+    setField("ma-total-asset", formatNumber(mainAccountObj.total_asset_value, 6));
+    setField("ma-collateral", formatValue(mainAccountObj.collateral));
+    setField("ma-balance", formatValue(mainAccountObj.available_balance));
+    setField("ma-mode", tradingMode(mainAccountObj.account_trading_mode));
+    setField("ma-status", accountStatusBadge(mainAccountObj, true) + onlineBadge(mainAccountObj));
+  }
+
+  function handleMainAccountAll(msg) {
+    if (!mainAccountObj) return;
+    if (msg.positions) {
+      var posArr = wsPositionsToArray(msg.positions);
+      mainAccountObj.positions = posArr;
+      mainAccountObj._hasPositions = posArr.some(function (p) {
+        return parseFloat(p.position_value) !== 0;
+      });
+    }
+    setField("ma-status", accountStatusBadge(mainAccountObj, true) + onlineBadge(mainAccountObj));
+  }
+
+  // ── Sub-accounts (track only expanded) ────────────────────
+
+  function subscribeSubAccount(accountIndex) {
+    var key = String(accountIndex);
+    if (trackedSubs[key]) return;
+    window.LighterWS.subscribe("user_stats/" + key, makeSubUserStatsHandler(key));
+    window.LighterWS.subscribe("account_all/" + key, makeSubAccountAllHandler(key));
+    trackedSubs[key] = setInterval(function () { refreshAccount(key); }, POLL_INTERVAL);
+  }
+
+  function unsubscribeSubAccount(accountIndex) {
+    var key = String(accountIndex);
+    if (!trackedSubs[key]) return;
+    clearInterval(trackedSubs[key]);
+    delete trackedSubs[key];
+    window.LighterWS.unsubscribe("user_stats/" + key);
+    window.LighterWS.unsubscribe("account_all/" + key);
+  }
+
+  function unsubscribeAllSubs() {
+    var keys = Object.keys(trackedSubs);
+    for (var i = 0; i < keys.length; i++) {
+      clearInterval(trackedSubs[keys[i]]);
+      window.LighterWS.unsubscribe("user_stats/" + keys[i]);
+      window.LighterWS.unsubscribe("account_all/" + keys[i]);
+    }
+    trackedSubs = {};
+  }
+
+  function makeSubUserStatsHandler(index) {
+    return function (msg) {
+      if (!msg.stats) return;
+      var sub = allSubAccounts.find(function (a) { return String(a.index) === index; });
+      if (!sub) return;
+
+      applyUserStats(sub, msg.stats);
+      if (sub._cachedDetail) {
+        applyUserStats(sub._cachedDetail.accounts[0], msg.stats);
+      }
+
+      // Update table row TAV
+      var row = subTbody.querySelector('tr.sub-row[data-index="' + index + '"]');
+      if (row) {
+        var tavCell = row.children[2];
+        if (tavCell) tavCell.textContent = formatNumber(sub.total_asset_value, 6);
+      }
+
+      // Re-render detail if expanded
+      if (expandedIndexes.has(index) && sub._cachedDetail) {
+        var detailRow = subTbody.querySelector('.detail-row[data-detail-for="' + index + '"]');
+        if (detailRow) {
+          detailRow.outerHTML = renderDetailRow(sub._cachedDetail, expandedColSpan, index);
+        }
+      }
+    };
+  }
+
+  function makeSubAccountAllHandler(index) {
+    return function (msg) {
+      var sub = allSubAccounts.find(function (a) { return String(a.index) === index; });
+      if (!sub) return;
+
+      if (!sub._cachedDetail) sub._cachedDetail = { accounts: [sub] };
+      var acc = sub._cachedDetail.accounts[0];
+
+      if (msg.positions) {
+        var posArr = wsPositionsToArray(msg.positions);
+        acc.positions = posArr;
+        acc._hasPositions = posArr.some(function (p) {
+          return parseFloat(p.position_value) !== 0;
+        });
+        sub._hasPositions = acc._hasPositions;
+      }
+
+      // Update table row status
+      var row = subTbody.querySelector('tr.sub-row[data-index="' + index + '"]');
+      if (row) {
+        var statusCell = row.children[1];
+        if (statusCell) statusCell.innerHTML = accountStatusBadge(sub) + onlineBadge(sub);
+      }
+
+      // Re-render detail if expanded
+      if (expandedIndexes.has(index) && sub._cachedDetail) {
+        var detailRow = subTbody.querySelector('.detail-row[data-detail-for="' + index + '"]');
+        if (detailRow) {
+          detailRow.outerHTML = renderDetailRow(sub._cachedDetail, expandedColSpan, index);
+        }
+      }
+    };
+  }
+
+  // ── Single account (ID search) ────────────────────────────
+
+  function subscribeSingleAccount(accountIndex) {
+    unsubscribeSingleAccount();
+    singleTrackId = String(accountIndex);
+    window.LighterWS.subscribe("user_stats/" + singleTrackId, handleSingleUserStats);
+    window.LighterWS.subscribe("account_all/" + singleTrackId, handleSingleAccountAll);
+    singlePollTimer = setInterval(function () { refreshAccount(singleTrackId); }, POLL_INTERVAL);
+  }
+
+  function unsubscribeSingleAccount() {
+    if (!singleTrackId) return;
+    if (singlePollTimer) { clearInterval(singlePollTimer); singlePollTimer = null; }
+    window.LighterWS.unsubscribe("user_stats/" + singleTrackId);
+    window.LighterWS.unsubscribe("account_all/" + singleTrackId);
+    singleTrackId = null;
+  }
+
+  function handleSingleUserStats(msg) {
+    if (!singleAccountData || !msg.stats) return;
+    var acc = singleAccountData.accounts && singleAccountData.accounts[0];
+    if (!acc) return;
+    applyUserStats(acc, msg.stats);
+    renderSingleAccount(acc);
+  }
+
+  function handleSingleAccountAll(msg) {
+    if (!singleAccountData) return;
+    var acc = singleAccountData.accounts && singleAccountData.accounts[0];
+    if (!acc) return;
+    if (msg.positions) {
+      var posArr = wsPositionsToArray(msg.positions);
+      acc.positions = posArr;
+      acc._hasPositions = posArr.some(function (p) {
+        return parseFloat(p.position_value) !== 0;
+      });
+    }
+    renderSingleAccount(acc);
+  }
+
+  // ── WebSocket: market data ──────────────────────────────
+
+  let marketDataReceived = false;
+
+  function handleMarketStats(msg) {
+    var raw = msg.market_stats;
+    if (!raw) return;
+
+    var statsList;
+    if (raw.symbol) {
+      statsList = [raw];
+    } else {
+      statsList = [];
+      var keys = Object.keys(raw);
+      for (var i = 0; i < keys.length; i++) {
+        if (raw[keys[i]] && typeof raw[keys[i]] === "object") {
+          statsList.push(raw[keys[i]]);
+        }
+      }
+    }
+
+    for (var i = 0; i < statsList.length; i++) {
+      var m = statsList[i];
+      var sym = m.symbol || "";
+      if (sym) {
+        marketData[sym] = {
+          mark_price: m.mark_price,
+          index_price: m.index_price,
+          open_interest: m.open_interest,
+          daily_volume: m.daily_quote_token_volume,
+        };
+      }
+    }
+
+    var count = Object.keys(marketData).length;
+    if (count > 0) {
+      var text = document.getElementById("ws-status-text");
+      if (text) text.textContent = "Live · " + count + " mkts";
+    }
+
+    if (!marketDataReceived && count > 0) {
+      marketDataReceived = true;
+      showToast("Market Data", count + " markets streaming", "success");
+    }
+
+    // Throttle mark price re-render for expanded detail panels
+    if (!marketRenderTimer && expandedIndexes.size > 0) {
+      marketRenderTimer = setTimeout(function () {
+        marketRenderTimer = null;
+        expandedIndexes.forEach(function (idx) {
+          var sub = allSubAccounts.find(function (a) { return String(a.index) === idx; });
+          if (sub && sub._cachedDetail) {
+            var detailRow = subTbody.querySelector('.detail-row[data-detail-for="' + idx + '"]');
+            if (detailRow) {
+              detailRow.outerHTML = renderDetailRow(sub._cachedDetail, expandedColSpan, idx);
+            }
+          }
+        });
+      }, 2000);
+    }
+  }
+
+  // ── WebSocket initialization ────────────────────────────
+
+  async function initWebSocket() {
+    try {
+      var resp = await fetch("/api/config");
+      if (!resp.ok) return;
+      var config = await resp.json();
+
+      window.LighterWS.onStatusChange(function (isConnected) {
+        var dot = document.getElementById("ws-dot");
+        var text = document.getElementById("ws-status-text");
+        dot.classList.toggle("ws-connected", isConnected);
+        text.textContent = isConnected ? "Live" : "Reconnecting...";
+        if (isConnected) {
+          showToast("WebSocket", "Connected to Lighter", "success");
+        }
+      });
+
+      window.LighterWS.init(config);
+
+      window.LighterWS.subscribe("market_stats/all", handleMarketStats);
+      window.LighterWS.subscribe("height", handleHeight);
+    } catch (e) {
+      console.warn("WebSocket init failed:", e);
+    }
+  }
+
+  // ── WebSocket: blockchain height ──────────────────────────
+
+  var heightFlashTimer = null;
+
+  function handleHeight(msg) {
+    var h = msg.height;
+    if (h === undefined) return;
+    var el = document.getElementById("block-height");
+    if (el) el.textContent = Number(h).toLocaleString();
+
+    // Flash the chip border on update
+    var chip = document.getElementById("block-chip");
+    if (chip) {
+      chip.classList.add("chip-flash");
+      if (heightFlashTimer) clearTimeout(heightFlashTimer);
+      heightFlashTimer = setTimeout(function () {
+        chip.classList.remove("chip-flash");
+      }, 600);
+    }
+  }
+
+  initWebSocket();
+
+  // ── Reset view ──────────────────────────────────────────
+
+  function resetView() {
+    input.value = "";
+    hide(mainSection);
+    hide(subSection);
+    hide(singleAccountSection);
+    hide(errorEl);
+    hide(loadingEl);
+    subSearch.value = "";
+    filterBalance.checked = false;
+    filterActivated.checked = false;
+    allSubAccounts = [];
+    expandedIndexes.clear();
+    mainAccountObj = null;
+    singleAccountData = null;
+    unsubscribeMasterAccount();
+    unsubscribeAllSubs();
+    unsubscribeSingleAccount();
+  }
+
+  // ── Title click → reset ────────────────────────────────
+
+  appTitle.addEventListener("click", () => {
+    resetView();
   });
 
   // ── Fetch & display ─────────────────────────────────────
@@ -321,38 +838,90 @@
   async function loadAddress(l1Address) {
     hide(mainSection);
     hide(subSection);
+    hide(singleAccountSection);
     hide(errorEl);
     show(loadingEl);
     subSearch.value = "";
     filterBalance.checked = false;
     filterActivated.checked = false;
 
+    // Clean up previous WS subscriptions
+    unsubscribeMasterAccount();
+    unsubscribeAllSubs();
+    unsubscribeSingleAccount();
+
     try {
-      const resp = await fetch(`/api/accounts?l1_address=${encodeURIComponent(l1Address)}`);
+      const resp = await fetch("/api/account?by=l1_address&value=" + encodeURIComponent(l1Address));
       if (!resp.ok) {
         const detail = await resp.json().catch(() => ({}));
-        throw new Error(detail.detail || `HTTP ${resp.status}`);
+        throw new Error(detail.detail || "HTTP " + resp.status);
       }
 
       const data = await resp.json();
-      const accounts = data.sub_accounts || [];
+      const accounts = data.accounts || [];
 
       if (accounts.length === 0) {
-        throw new Error("No accounts found for this L1 address.");
+        throw new Error("No accounts found for address " + l1Address);
       }
 
       // Main account: account_type === 0 (exactly one)
       const main = accounts.find((a) => a.account_type === 0);
-      // Sub-accounts: account_type === 1
-      allSubAccounts = accounts.filter((a) => a.account_type === 1);
+      // Sub-accounts: account_type === 1, with positions cached
+      allSubAccounts = accounts.filter((a) => a.account_type === 1).map((acc) => {
+        const realPositions = (acc.positions || []).filter((p) => parseFloat(p.position_value) !== 0);
+        acc._hasPositions = realPositions.length > 0;
+        acc._cachedDetail = { accounts: [acc] };
+        return acc;
+      });
 
       if (main) {
         renderMainAccount(main, allSubAccounts);
+        subscribeMasterAccount(main.index);
       }
 
       subCount.textContent = allSubAccounts.length;
-      renderSubAccounts(allSubAccounts);
+      updateSortIndicators();
+      applyFilters();
       show(subSection);
+    } catch (err) {
+      errorEl.textContent = err.message;
+      show(errorEl);
+    } finally {
+      hide(loadingEl);
+    }
+  }
+
+  // ── Fetch single account by ID ─────────────────────────
+
+  async function loadAccountById(accountId) {
+    hide(mainSection);
+    hide(subSection);
+    hide(singleAccountSection);
+    hide(errorEl);
+    show(loadingEl);
+
+    // Clean up previous WS subscriptions
+    unsubscribeMasterAccount();
+    unsubscribeAllSubs();
+    unsubscribeSingleAccount();
+
+    try {
+      const resp = await fetch("/api/account?by=index&value=" + encodeURIComponent(accountId));
+      if (!resp.ok) {
+        const detail = await resp.json().catch(() => ({}));
+        throw new Error(detail.detail || "HTTP " + resp.status);
+      }
+
+      const data = await resp.json();
+      const accounts = data.accounts || [];
+
+      if (accounts.length === 0) {
+        throw new Error("Account #" + accountId + " not found");
+      }
+
+      singleAccountData = data;
+      renderSingleAccount(accounts[0]);
+      subscribeSingleAccount(accountId);
     } catch (err) {
       errorEl.textContent = err.message;
       show(errorEl);
@@ -368,7 +937,7 @@
 
   function loadHistory() {
     try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) || []; }
-    catch { return []; }
+    catch (e) { return []; }
   }
 
   function saveToHistory(addr) {
@@ -382,19 +951,43 @@
 
   function renderHistory(history) {
     historyDatalist.innerHTML = history
-      .map((a) => `<option value="${a}">`)
+      .map((a) => '<option value="' + a + '">')
       .join("");
   }
 
   renderHistory(loadHistory());
 
+  // Apply default sort indicator on page load
+  updateSortIndicators();
+
   // ── Form submit ─────────────────────────────────────────
+
+  function doSearch() {
+    const val = input.value.trim();
+    if (!val) return;
+    saveToHistory(val);
+
+    // Detect input type: 0x... = L1 address, integer = account ID
+    if (val.startsWith("0x")) {
+      loadAddress(val);
+    } else if (/^\d+$/.test(val)) {
+      loadAccountById(val);
+    } else {
+      errorEl.textContent = "Invalid input. Enter a 0x... L1 address or a numeric account ID.";
+      show(errorEl);
+    }
+  }
 
   form.addEventListener("submit", (e) => {
     e.preventDefault();
-    const addr = input.value.trim();
-    if (!addr) return;
-    saveToHistory(addr);
-    loadAddress(addr);
+    doSearch();
+  });
+
+  // Explicit Enter key handler (datalist can intercept form submit)
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      doSearch();
+    }
   });
 })();

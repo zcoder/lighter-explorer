@@ -6,7 +6,11 @@ import httpx
 
 LIGHTER_BASE_URL = os.environ.get("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai")
 
-app = FastAPI(title="Lighter Perps Dashboard")
+# Derive WS URL from base: https:// → wss://, http:// → ws://, append /stream
+_ws_scheme = "wss://" if LIGHTER_BASE_URL.startswith("https://") else "ws://"
+LIGHTER_WS_URL = _ws_scheme + LIGHTER_BASE_URL.split("://", 1)[1].rstrip("/") + "/stream"
+
+app = FastAPI(title="Lighter Explorer")
 
 http_client = httpx.AsyncClient(base_url=LIGHTER_BASE_URL, timeout=15.0)
 
@@ -16,17 +20,28 @@ async def shutdown():
     await http_client.aclose()
 
 
+# ── Config endpoint ──────────────────────────────────────────────────
+
+@app.get("/api/config")
+async def get_config():
+    """Return frontend configuration."""
+    return {
+        "ws_url": LIGHTER_WS_URL,
+    }
+
+
 # ── Lighter proxy endpoints ──────────────────────────────────────────
 
 @app.get("/api/accounts")
 async def get_accounts_by_l1(l1_address: str = Query(..., description="Ethereum L1 address")):
-    """Return all sub-accounts linked to an L1 address."""
+    """Return all accounts with full detail (positions, balances) for an L1 address."""
     resp = await http_client.get(
-        "/api/v1/accountsByL1Address",
-        params={"l1_address": l1_address},
+        "/api/v1/account",
+        params={"by": "l1_address", "value": l1_address},
     )
     if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail="Lighter API error")
+        msg = _lighter_error(resp)
+        raise HTTPException(status_code=resp.status_code, detail=msg)
     return resp.json()
 
 
@@ -41,8 +56,18 @@ async def get_account_detail(
         params={"by": by, "value": value},
     )
     if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail="Lighter API error")
+        msg = _lighter_error(resp)
+        raise HTTPException(status_code=resp.status_code, detail=msg)
     return resp.json()
+
+
+def _lighter_error(resp) -> str:
+    """Extract human-readable error from Lighter API response."""
+    try:
+        data = resp.json()
+        return data.get("message", "Lighter API error")
+    except Exception:
+        return "Lighter API error"
 
 
 # ── Serve frontend ───────────────────────────────────────────────────

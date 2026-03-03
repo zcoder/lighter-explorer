@@ -31,10 +31,88 @@ header {
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   padding: 1rem 2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: sticky;
+  top: 0;
+  z-index: 100;
 }
 
 header h1 {
   font-size: 1.25rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+header h1:hover {
+  color: var(--accent);
+}
+
+/* ── Header info area ─────────────────────────────────── */
+
+.header-info {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  position: absolute;
+  right: 2rem;
+}
+
+.header-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.65rem;
+  border-radius: 6px;
+  background: rgba(48, 54, 61, 0.6);
+  border: 1px solid var(--border);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  transition: border-color 0.3s;
+}
+
+.chip-icon {
+  font-size: 0.8rem;
+  color: var(--accent);
+  opacity: 0.7;
+}
+
+.chip-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+}
+
+.chip-value {
+  font-family: "SF Mono", "Fira Code", monospace;
+  font-size: 0.75rem;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.header-chip.chip-flash {
+  border-color: var(--accent);
+}
+
+/* ── WS connection indicator ───────────────────────────── */
+
+.ws-chip .chip-value {
+  font-family: inherit;
+  font-weight: 400;
+}
+
+.ws-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--red);
+  transition: background 0.3s;
+}
+
+.ws-dot.ws-connected {
+  background: var(--green);
 }
 
 /* ── Main ───────────────────────────────────────────────── */
@@ -294,6 +372,38 @@ tbody tr:not(.sub-row):not(.detail-row):hover {
   color: var(--red);
 }
 
+.badge-trading {
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--green);
+  cursor: help;
+}
+
+.badge-idle {
+  background: rgba(139, 148, 158, 0.15);
+  color: var(--text-muted);
+  cursor: help;
+}
+
+.badge-check {
+  background: rgba(210, 153, 34, 0.15);
+  color: #d29922;
+  cursor: help;
+}
+
+.badge-online {
+  background: rgba(63, 185, 80, 0.1);
+  color: var(--green);
+  font-size: 0.65rem;
+  font-weight: 500;
+  padding: 0.1rem 0.4rem;
+  cursor: help;
+}
+
+.badge-unknown {
+  background: rgba(139, 148, 158, 0.15);
+  color: var(--text-muted);
+}
+
 .badge-type {
   background: rgba(88, 166, 255, 0.12);
   color: var(--accent);
@@ -405,6 +515,15 @@ tr.detail-row > td {
   color: var(--red);
 }
 
+.badge-isolated {
+  background: rgba(210, 153, 34, 0.12);
+  color: #d29922;
+  font-size: 0.6rem;
+  font-weight: 500;
+  padding: 0.1rem 0.35rem;
+  cursor: help;
+}
+
 /* ── Utility ────────────────────────────────────────────── */
 
 .hidden {
@@ -442,4 +561,101 @@ tr.detail-row > td {
   background: rgba(248, 81, 73, 0.08);
   border: 1px solid rgba(248, 81, 73, 0.3);
   border-radius: 8px;
+}
+
+/* ── Toast notifications ───────────────────────────────── */
+
+#toast-container {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-width: 380px;
+  pointer-events: none;
+}
+
+.toast {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  font-size: 0.85rem;
+  color: var(--text);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  pointer-events: auto;
+  animation: toast-in 0.3s ease-out;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  border-left: 3px solid var(--accent);
+}
+
+.toast-info    { border-left-color: var(--accent); }
+.toast-success { border-left-color: var(--green); }
+.toast-warning { border-left-color: #d29922; }
+.toast-error   { border-left-color: var(--red); }
+
+.toast-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.toast-title {
+  font-weight: 600;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  margin-bottom: 0.2rem;
+}
+
+.toast-info .toast-title    { color: var(--accent); }
+.toast-success .toast-title { color: var(--green); }
+.toast-warning .toast-title { color: #d29922; }
+.toast-error .toast-title   { color: var(--red); }
+
+.toast-message {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  word-break: break-word;
+}
+
+.toast-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.toast-close:hover {
+  color: var(--text);
+}
+
+.toast-out {
+  animation: toast-out 0.2s ease-in forwards;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(100%); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes toast-out {
+  from { opacity: 1; transform: translateX(0); }
+  to   { opacity: 0; transform: translateX(100%); }
+}
+
+/* ── Live data flash ───────────────────────────────────── */
+
+.live-value {
+  transition: color 0.3s ease;
+}
+
+.live-flash {
+  color: var(--accent) !important;
 }
