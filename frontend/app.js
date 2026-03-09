@@ -30,10 +30,23 @@
   const exportAllLabel   = $("export-all-label");
   const exportFilteredBtn   = $("export-filtered");
   const exportFilteredLabel = $("export-filtered-label");
+  const logsModal        = $("logs-modal");
+  const logsAccountLabel = $("logs-account-id");
+  const logsTbody        = $("logs-tbody");
+  const logsTable        = $("logs-table");
+  const logsLoading      = $("logs-loading");
+  const logsEmpty        = $("logs-empty");
+  const logsExportBtn    = $("logs-export-csv");
+  const settingsModal    = $("settings-modal");
+  const logsExportModal    = $("logs-export-modal");
+  const logsExportProgress = $("logs-export-progress");
+  const logsExportFullBtn  = $("logs-export-full");
+  const logsExportFullLabel = $("logs-export-full-label");
   const WS = window.LighterWS;
 
   // ── State ───────────────────────────────────────────────
   let allSubAccounts    = [];
+  const subAccountMap   = new Map();
   let expandedIndexes   = new Set();
   let expandedColSpan   = 6;
   let sortKey           = "_accountStatus";
@@ -48,8 +61,22 @@
 
   let masterTrackId     = null;
   let singleTrackId     = null;
-  let trackedSubs       = {};       // { index: true }
+  let trackedSubs       = new Set();
   let expandGeneration  = {};       // { index: counter } for race condition
+
+  let explorerBaseUrl   = "https://explorer.elliot.ai";
+  let logsAccountId     = null;
+  let logsOffset        = 0;
+  let isLoadingLogs      = false;
+  let logsAllLoaded     = false;
+  let logsData          = [];
+  const LOGS_LIMIT      = 50;
+  const logsCache       = {};   // { accountId: { data: [], allLoaded: bool } }
+
+  let marketIndexMap    = {};   // { market_index: symbol }
+
+  let settingTz    = localStorage.getItem("lighter_tz") || "local";
+  let settingTheme = localStorage.getItem("lighter_theme") || "auto";
 
   // ── Pure helpers ──────────────────────────────────────────
 
@@ -79,6 +106,27 @@
 
   function tradingMode(mode) {
     return mode === 1 ? "Unified" : "Classic";
+  }
+
+  // ── Fetch with proxy fallback ──────────────────────────
+
+  async function fetchJson(proxyUrl, directUrl) {
+    try {
+      const resp = await fetch(proxyUrl);
+      if (!resp.ok) throw new Error("proxy");
+      return await resp.json();
+    } catch {
+      const resp = await fetch(directUrl);
+      if (!resp.ok) throw new Error("request failed");
+      return await resp.json();
+    }
+  }
+
+  function logsUrl(accountId, limit, offset) {
+    return [
+      "/api/account-logs/" + encodeURIComponent(accountId) + "?limit=" + limit + "&offset=" + offset,
+      explorerBaseUrl + "/api/accounts/" + encodeURIComponent(accountId) + "/logs?limit=" + limit + "&offset=" + offset,
+    ];
   }
 
   function hasBalance(acc) {
@@ -169,8 +217,10 @@
     return true;
   }
 
+  const TRADE_STATS_KEYS = ["daily_trades_count", "daily_volume", "weekly_trades_count", "weekly_volume", "total_trades_count", "total_volume"];
+
   function applyTradeStats(acc, msg) {
-    const keys = ["daily_trades_count", "daily_volume", "weekly_trades_count", "weekly_volume", "total_trades_count", "total_volume"];
+    const keys = TRADE_STATS_KEYS;
     for (const k of keys) {
       if (msg[k] !== undefined) acc[k] = msg[k];
     }
@@ -416,10 +466,13 @@
 
     const leverageMarginHtml = acctMarginBar(liveAsset, totals.margin);
 
-    // Refresh button
+    // Action buttons
     const refreshBtn = refreshIndex
       ? '<div class="field"><span class="label">&nbsp;</span>' +
-        '<button class="btn-refresh" data-refresh="' + esc(refreshIndex) + '" title="Re-fetch account data">&#x21bb; Refresh</button></div>'
+        '<div style="display:flex;gap:0.4rem">' +
+        '<button class="btn-refresh" data-refresh="' + esc(refreshIndex) + '" title="Re-fetch account data">&#x21bb; Refresh</button>' +
+        '<button class="btn-refresh" data-history="' + esc(refreshIndex) + '" title="View transaction history">History</button>' +
+        '</div></div>'
       : '';
 
     return '<div class="detail-grid">' +
@@ -535,7 +588,7 @@
 
   function reRenderDetail(index) {
     if (!expandedIndexes.has(index)) return;
-    const sub = allSubAccounts.find((a) => String(a.index) === index);
+    const sub = findSub(index);
     if (!sub || !sub._cachedDetail) return;
     const detailRow = getDetailRow(index);
     if (detailRow) detailRow.outerHTML = renderDetailRow(sub._cachedDetail, expandedColSpan, index);
@@ -673,6 +726,334 @@
 
   function hideExportModal() { hide(exportModal); }
 
+  // ── Account logs ───────────────────────────────────────
+
+  const LOG_LABELS = {
+    Trade: ["Trade", "log-trade"],
+    TradeWithFunding: ["Trade", "log-trade"],
+    LiquidationTrade: ["Liquidation", "log-liq"],
+    LiquidationTradeWithFunding: ["Liquidation", "log-liq"],
+    L2UpdateLeverage: ["Leverage", "log-leverage"],
+    L2TransferV2: ["Transfer", "log-transfer"],
+    L2Transfer: ["Transfer", "log-transfer"],
+    L1Deposit: ["Deposit", "log-deposit"],
+    Withdraw: ["Withdraw", "log-withdraw"],
+    L2UpdateMargin: ["Margin", "log-leverage"],
+    L2CreateSubAccount: ["New Sub", "log-other"],
+    ExitPosition: ["Exit", "log-trade"],
+    ExitPositionWithFunding: ["Exit", "log-trade"],
+    Deleverage: ["Deleverage", "log-liq"],
+    DeleverageWithFunding: ["Deleverage", "log-liq"],
+  };
+
+  async function fetchMarkets() {
+    if (Object.keys(marketIndexMap).length > 0) return;
+    try {
+      const data = await fetchJson("/api/markets", explorerBaseUrl + "/api/markets");
+      if (Array.isArray(data)) {
+        for (const m of data) marketIndexMap[m.market_index] = m.symbol;
+      }
+    } catch { /* ignore */ }
+  }
+
+  function marketSymbol(idx) {
+    return marketIndexMap[idx] || ("Mkt#" + idx);
+  }
+
+  function logTypeBadge(pubdataType) {
+    const info = LOG_LABELS[pubdataType] || [pubdataType, "log-other"];
+    return '<span class="badge badge-log ' + info[1] + '">' + esc(info[0]) + '</span>';
+  }
+
+  function logDetails(log) {
+    const pd = log.pubdata || {};
+
+    // Trade
+    const trade = pd.trade_pubdata || pd.trade_pubdata_with_funding;
+    if (trade) {
+      const side = trade.is_taker_ask === 0 ? "Buy" : "Sell";
+      const sideClass = trade.is_taker_ask === 0 ? "pnl-positive" : "pnl-negative";
+      return '<span class="' + sideClass + '">' + side + '</span>' +
+        ' ' + esc(marketSymbol(trade.market_index)) +
+        ' @ ' + esc(trade.price) + ' &times; ' + esc(trade.size);
+    }
+
+    // Leverage
+    const lev = pd.l2_update_leverage_pubdata;
+    if (lev) {
+      const mult = lev.initial_margin_fraction > 0 ? Math.round(10000 / lev.initial_margin_fraction) + "x" : "?";
+      const mode = lev.margin_mode === 1 ? "isolated" : "cross";
+      return esc(marketSymbol(lev.market_index)) + ' &rarr; ' + mult + ' ' + mode;
+    }
+
+    // Transfer
+    const xfer = pd.l2_transfer_pubdata_v2 || pd.l2_transfer_pubdata;
+    if (xfer) {
+      const isFrom = String(xfer.from_account_index) === String(logsAccountId);
+      if (isFrom) {
+        return '<span class="pnl-negative">&rarr;</span> #' + esc(xfer.to_account_index) + ' ' + esc(xfer.amount) + ' ' + esc(xfer.asset_index || "USDC");
+      }
+      return '<span class="pnl-positive">&larr;</span> #' + esc(xfer.from_account_index) + ' ' + esc(xfer.amount) + ' ' + esc(xfer.asset_index || "USDC");
+    }
+
+    return "—";
+  }
+
+  function formatLogTime(isoStr) {
+    const d = new Date(isoStr);
+    const utcStr = d.toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+    const localStr = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+      d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+    if (settingTz === "utc") {
+      const shown = d.toLocaleDateString("en-US", { month: 'short', day: 'numeric', timeZone: 'UTC' }) + ' ' +
+        d.toLocaleTimeString("en-US", { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'UTC', hour12: false });
+      return { display: shown, tooltip: localStr + ' (local)' };
+    }
+    return { display: localStr, tooltip: utcStr };
+  }
+
+  function renderLogRow(log) {
+    const type = log.pubdata_type || log.tx_type || "Unknown";
+    const time = formatLogTime(log.time);
+
+    let badge = logTypeBadge(type);
+    if (type === "L2TransferV2" || type === "L2Transfer") {
+      const xfer = (log.pubdata || {}).l2_transfer_pubdata_v2 || (log.pubdata || {}).l2_transfer_pubdata;
+      if (xfer) {
+        const dir = String(xfer.from_account_index) === String(logsAccountId) ? "OUT" : "IN";
+        badge = '<span class="badge badge-log log-transfer">Transfer (' + dir + ')</span>';
+      }
+    }
+
+    return '<tr>' +
+      '<td style="white-space:nowrap" title="' + esc(time.tooltip) + '">' + esc(time.display) + '</td>' +
+      '<td>' + badge + '</td>' +
+      '<td>' + logDetails(log) + '</td>' +
+      '<td><span class="badge badge-log log-other">' + esc(log.status || "") + '</span></td>' +
+    '</tr>';
+  }
+
+  function rerenderLogs() {
+    if (!logsData.length) return;
+    logsTbody.innerHTML = logsData.map(renderLogRow).join("");
+  }
+
+  async function loadLogs(append) {
+    if (isLoadingLogs) return;
+    if (append && logsAllLoaded) return;
+
+    if (!append) {
+      logsTbody.innerHTML = "";
+      logsOffset = 0;
+      logsAllLoaded = false;
+      logsData = [];
+      hide(logsEmpty);
+    }
+
+    isLoadingLogs = true;
+    show(logsLoading);
+
+    try {
+      const [proxyUrl, directUrl] = logsUrl(logsAccountId, LOGS_LIMIT, logsOffset);
+      const logs = await fetchJson(proxyUrl, directUrl);
+
+      hide(logsLoading);
+
+      if (logs.length === 0 && logsOffset === 0) {
+        show(logsEmpty);
+        hide(logsTable);
+        hide(logsExportBtn);
+        logsAllLoaded = true;
+        isLoadingLogs = false;
+        return;
+      }
+
+      show(logsTable);
+      show(logsExportBtn);
+      logsData = logsData.concat(logs);
+      logsTbody.insertAdjacentHTML("beforeend", logs.map(renderLogRow).join(""));
+      logsOffset += logs.length;
+
+      if (logs.length < LOGS_LIMIT) {
+        logsAllLoaded = true;
+      }
+      if (logsAccountId) {
+        logsCache[logsAccountId] = { data: logsData.slice(), allLoaded: logsAllLoaded };
+      }
+    } catch (err) {
+      hide(logsLoading);
+      showToast("Error", "Failed to load account history", "error");
+    }
+    isLoadingLogs = false;
+  }
+
+  async function openLogsModal(accountId) {
+    logsAccountId = String(accountId);
+    logsAccountLabel.textContent = "#" + logsAccountId;
+    show(logsModal);
+    hide(logsExportBtn);
+    await fetchMarkets();
+
+    const cached = logsCache[logsAccountId];
+    if (cached && cached.data.length > 0) {
+      logsData = cached.data.slice();
+      logsOffset = logsData.length;
+      logsAllLoaded = cached.allLoaded;
+      logsTbody.innerHTML = logsData.map(renderLogRow).join("");
+      show(logsTable);
+      show(logsExportBtn);
+      hide(logsEmpty);
+      // Fetch new logs that appeared since cache
+      await loadNewLogs();
+    } else {
+      loadLogs(false);
+    }
+  }
+
+  async function loadNewLogs() {
+    if (!logsAccountId || !logsData.length) return;
+    const firstTime = logsData[0].time;
+
+    try {
+      let newLogs = [];
+      let off = 0;
+      while (true) {
+        let batch;
+        try {
+          const [proxyUrl, directUrl] = logsUrl(logsAccountId, LOGS_LIMIT, off);
+          batch = await fetchJson(proxyUrl, directUrl);
+        } catch { break; }
+        if (!batch.length) break;
+
+        let hitExisting = false;
+        for (const log of batch) {
+          if (log.time <= firstTime) { hitExisting = true; break; }
+          newLogs.push(log);
+        }
+        if (hitExisting || batch.length < LOGS_LIMIT) break;
+        off += batch.length;
+      }
+
+      if (newLogs.length > 0) {
+        logsData = newLogs.concat(logsData);
+        logsOffset = logsData.length;
+        logsTbody.innerHTML = logsData.map(renderLogRow).join("");
+        showToast("History", newLogs.length + " new entries", "info");
+      }
+    } catch { /* ignore */ }
+  }
+
+  function closeLogsModal() {
+    // Save to cache before closing
+    if (logsAccountId && logsData.length > 0) {
+      logsCache[logsAccountId] = { data: logsData.slice(), allLoaded: logsAllLoaded };
+    }
+    hide(logsModal);
+    logsAccountId = null;
+    logsData = [];
+    logsTbody.innerHTML = "";
+    hide(logsTable);
+    hide(logsEmpty);
+    hide(logsLoading);
+  }
+
+  // ── Logs CSV export ─────────────────────────────────────
+
+  function logCsvRow(log) {
+    const pd = log.pubdata || {};
+    const type = log.pubdata_type || log.tx_type || "";
+    const time = log.time || "";
+
+    let side = "", market = "", price = "", size = "", leverage = "", direction = "", amount = "";
+
+    const trade = pd.trade_pubdata || pd.trade_pubdata_with_funding;
+    if (trade) {
+      side = trade.is_taker_ask === 0 ? "Buy" : "Sell";
+      market = marketSymbol(trade.market_index);
+      price = trade.price || "";
+      size = trade.size || "";
+    }
+
+    const lev = pd.l2_update_leverage_pubdata;
+    if (lev) {
+      market = marketSymbol(lev.market_index);
+      leverage = lev.initial_margin_fraction > 0 ? Math.round(10000 / lev.initial_margin_fraction) + "x" : "";
+    }
+
+    const xfer = pd.l2_transfer_pubdata_v2 || pd.l2_transfer_pubdata;
+    if (xfer) {
+      const isFrom = String(xfer.from_account_index) === String(logsAccountId);
+      direction = isFrom ? "send to #" + xfer.to_account_index : "receive from #" + xfer.from_account_index;
+      amount = xfer.amount || "";
+    }
+
+    return [time, type, side, market, price, size, leverage, direction, amount, log.status || ""]
+      .map(csvEscape).join(",");
+  }
+
+  function downloadLogsCsv(logs) {
+    const header = "time,type,side,market,price,size,leverage,transfer,amount,status";
+    const rows = [header].concat(logs.map(logCsvRow));
+    const blob = new Blob([rows.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "lighter_history_" + logsAccountId + "_" + csvTimestamp() + ".csv";
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast("CSV Export", logs.length + " log entries exported", "success");
+  }
+
+  async function fetchAllLogs() {
+    const all = [];
+    let offset = 0;
+    const limit = 100;
+
+    logsExportFullBtn.disabled = true;
+    show(logsExportProgress);
+
+    try {
+      while (true) {
+        logsExportProgress.textContent = "Loading... " + all.length + " entries";
+
+        const [proxyUrl, directUrl] = logsUrl(logsAccountId, limit, offset);
+        const logs = await fetchJson(proxyUrl, directUrl);
+
+        all.push(...logs);
+        offset += logs.length;
+
+        if (logs.length < limit) break;
+      }
+
+      // Update the visible table with all data
+      logsData = all;
+      logsOffset = all.length;
+      logsAllLoaded = true;
+      logsCache[logsAccountId] = { data: all.slice(), allLoaded: true };
+      logsTbody.innerHTML = all.map(renderLogRow).join("");
+      show(logsTable);
+
+      hide(logsExportModal);
+      downloadLogsCsv(all);
+    } catch {
+      showToast("Error", "Failed to load full history", "error");
+    } finally {
+      logsExportFullBtn.disabled = false;
+      hide(logsExportProgress);
+    }
+  }
+
+  function showLogsExportModal() {
+    logsExportFullLabel.textContent = logsAllLoaded
+      ? "Full history (" + logsData.length + ")"
+      : "Full history (load all)";
+    $("logs-export-loaded-label").textContent = "Loaded (" + logsData.length + ")";
+    hide(logsExportProgress);
+    logsExportFullBtn.disabled = false;
+    show(logsExportModal);
+  }
+
   // ── WS: subscription management ───────────────────────
 
   function subscribeMasterAccount(accountIndex) {
@@ -680,7 +1061,6 @@
     masterTrackId = String(accountIndex);
     WS.subscribe("user_stats/" + masterTrackId, handleMainUserStats);
     WS.subscribe("account_all/" + masterTrackId, handleMainAccountAll);
-    showToast("WebSocket", "Subscribed to master #" + masterTrackId, "success");
   }
 
   function unsubscribeMasterAccount() {
@@ -692,17 +1072,16 @@
 
   function subscribeSubAccount(accountIndex) {
     const key = String(accountIndex);
-    if (trackedSubs[key]) return;
+    if (trackedSubs.has(key)) return;
     WS.subscribe("user_stats/" + key, makeSubUserStatsHandler(key));
     WS.subscribe("account_all/" + key, makeSubAccountAllHandler(key));
-    trackedSubs[key] = true;
-    showToast("WebSocket", "Subscribed to sub #" + key, "success");
+    trackedSubs.add(key);
   }
 
   function unsubscribeSubAccount(accountIndex) {
     const key = String(accountIndex);
-    if (!trackedSubs[key]) return;
-    delete trackedSubs[key];
+    if (!trackedSubs.has(key)) return;
+    trackedSubs.delete(key);
     WS.unsubscribe("user_stats/" + key);
     WS.unsubscribe("account_all/" + key);
     // No individual toast — reduces spam
@@ -712,15 +1091,14 @@
     const key = String(accountIndex);
     unsubscribeSubAccount(key);
     subscribeSubAccount(key);
-    showToast("WebSocket", "Refreshed subscription for #" + key, "info");
   }
 
   function unsubscribeAllSubs() {
-    for (const key of Object.keys(trackedSubs)) {
+    for (const key of trackedSubs) {
       WS.unsubscribe("user_stats/" + key);
       WS.unsubscribe("account_all/" + key);
     }
-    trackedSubs = {};
+    trackedSubs.clear();
   }
 
   function subscribeSingleAccount(accountIndex) {
@@ -728,7 +1106,6 @@
     singleTrackId = String(accountIndex);
     WS.subscribe("user_stats/" + singleTrackId, handleSingleUserStats);
     WS.subscribe("account_all/" + singleTrackId, handleSingleAccountAll);
-    showToast("WebSocket", "Subscribed to account #" + singleTrackId, "success");
   }
 
   function unsubscribeSingleAccount() {
@@ -741,7 +1118,7 @@
   // ── WS: message handlers ──────────────────────────────
 
   function findSub(index) {
-    return allSubAccounts.find((a) => String(a.index) === index);
+    return subAccountMap.get(String(index));
   }
 
   function handleMainUserStats(msg) {
@@ -873,6 +1250,7 @@
         if (isConnected) showToast("WebSocket", "Connected to Lighter", "success");
       });
 
+      if (config.explorer_url) explorerBaseUrl = config.explorer_url;
       WS.init(config);
       WS.subscribe("market_stats/all", handleMarketStats);
       WS.subscribe("height", handleHeight);
@@ -915,6 +1293,7 @@
     filterBalance.checked = false;
     filterActivated.checked = false;
     allSubAccounts = [];
+    subAccountMap.clear();
     expandedIndexes.clear();
     expandGeneration = {};
     mainAccountObj = null;
@@ -948,9 +1327,11 @@
       if (accounts.length === 0) throw new Error("No accounts found for address " + l1Address);
 
       const main = accounts.find((a) => a.account_type === 0);
+      subAccountMap.clear();
       allSubAccounts = accounts.filter((a) => a.account_type === 1).map((acc) => {
         acc._hasPositions = hasRealPositions(acc.positions);
         acc._cachedDetail = { accounts: [acc] };
+        subAccountMap.set(String(acc.index), acc);
         return acc;
       });
 
@@ -1043,10 +1424,17 @@
 
   // Sub-account row expand/collapse + refresh
   subTbody.addEventListener("click", async (e) => {
-    const refreshBtn = e.target.closest(".btn-refresh");
+    const refreshBtn = e.target.closest(".btn-refresh[data-refresh]");
     if (refreshBtn) {
       e.stopPropagation();
       refreshSubAccount(refreshBtn.dataset.refresh);
+      return;
+    }
+
+    const historyBtn = e.target.closest("[data-history]");
+    if (historyBtn) {
+      e.stopPropagation();
+      openLogsModal(historyBtn.dataset.history);
       return;
     }
 
@@ -1071,7 +1459,7 @@
     row.classList.add("expanded");
 
     const colSpan = expandedColSpan;
-    const sub = allSubAccounts.find((a) => String(a.index) === String(index));
+    const sub = findSub(index);
 
     if (sub && sub._cachedDetail) {
       const tmp = document.createElement("tr");
@@ -1122,8 +1510,12 @@
     applyFilters();
   });
 
-  // Filters
-  subSearch.addEventListener("input", applyFilters);
+  // Filters (debounce text input for large account lists)
+  let _filterTimer = null;
+  subSearch.addEventListener("input", () => {
+    clearTimeout(_filterTimer);
+    _filterTimer = setTimeout(applyFilters, 120);
+  });
   filterBalance.addEventListener("change", applyFilters);
   filterActivated.addEventListener("change", applyFilters);
 
@@ -1145,14 +1537,26 @@
   $("export-cancel").addEventListener("click", hideExportModal);
   exportModal.addEventListener("click", (e) => { if (e.target === exportModal) hideExportModal(); });
 
-  // Single account refresh
+  // Single account refresh + history
   singleSection.addEventListener("click", (e) => {
-    const refreshBtn = e.target.closest(".btn-refresh");
+    const historyBtn = e.target.closest("[data-history]");
+    if (historyBtn) {
+      e.stopPropagation();
+      openLogsModal(historyBtn.dataset.history);
+      return;
+    }
+
+    const refreshBtn = e.target.closest(".btn-refresh[data-refresh]");
     if (!refreshBtn || !singleTrackId) return;
     e.stopPropagation();
     const idx = singleTrackId;
     unsubscribeSingleAccount();
     subscribeSingleAccount(idx);
+  });
+
+  // Main account history
+  $("ma-history").addEventListener("click", () => {
+    if (mainAccountObj) openLogsModal(mainAccountObj.index);
   });
 
   // Title click resets
@@ -1164,9 +1568,104 @@
     if (e.key === "Enter") { e.preventDefault(); doSearch(); }
   });
 
+  // Logs modal
+  $("logs-close").addEventListener("click", closeLogsModal);
+  logsModal.addEventListener("click", (e) => { if (e.target === logsModal) closeLogsModal(); });
+  $("logs-content").addEventListener("scroll", (e) => {
+    const el = e.target;
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 60) {
+      loadLogs(true);
+    }
+  });
+  // Logs export
+  $("logs-export-csv").addEventListener("click", showLogsExportModal);
+  $("logs-export-full").addEventListener("click", () => {
+    if (logsAllLoaded) {
+      hide(logsExportModal);
+      downloadLogsCsv(logsData);
+    } else {
+      fetchAllLogs();
+    }
+  });
+  $("logs-export-loaded").addEventListener("click", () => {
+    hide(logsExportModal);
+    downloadLogsCsv(logsData);
+  });
+  $("logs-export-cancel").addEventListener("click", () => hide(logsExportModal));
+  logsExportModal.addEventListener("click", (e) => { if (e.target === logsExportModal) hide(logsExportModal); });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (!logsExportModal.classList.contains("hidden")) { hide(logsExportModal); return; }
+    if (!settingsModal.classList.contains("hidden")) { hide(settingsModal); return; }
+    if (!logsModal.classList.contains("hidden")) closeLogsModal();
+  });
+
   // Handle browser back/forward for deep links
   window.addEventListener("hashchange", () => {
     loadFromUrlHash();
+  });
+
+  // ── Settings ────────────────────────────────────────────
+
+  function resolveTheme(pref) {
+    if (pref === "light" || pref === "dark") return pref;
+    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  }
+
+  function applyTheme(pref) {
+    const resolved = resolveTheme(pref);
+    if (resolved === "light") {
+      document.documentElement.setAttribute("data-theme", "light");
+    } else {
+      document.documentElement.removeAttribute("data-theme");
+    }
+  }
+
+  function updateSettingsUI() {
+    settingsModal.querySelectorAll("[data-tz]").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.tz === settingTz);
+    });
+    settingsModal.querySelectorAll("[data-theme]").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.theme === settingTheme);
+    });
+  }
+
+  applyTheme(settingTheme);
+
+  // Listen for OS theme changes when set to auto
+  window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+    if (settingTheme === "auto") applyTheme("auto");
+  });
+
+  function openSettings() {
+    updateSettingsUI();
+    show(settingsModal);
+  }
+
+  $("settings-btn").addEventListener("click", openSettings);
+
+  $("settings-close").addEventListener("click", () => hide(settingsModal));
+
+  settingsModal.addEventListener("click", (e) => {
+    const tzBtn = e.target.closest("[data-tz]");
+    if (tzBtn) {
+      settingTz = tzBtn.dataset.tz;
+      localStorage.setItem("lighter_tz", settingTz);
+      updateSettingsUI();
+      rerenderLogs();
+      return;
+    }
+    const themeBtn = e.target.closest("[data-theme]");
+    if (themeBtn) {
+      settingTheme = themeBtn.dataset.theme;
+      localStorage.setItem("lighter_theme", settingTheme);
+      applyTheme(settingTheme);
+      updateSettingsUI();
+      return;
+    }
+    // Close only on overlay click (not on inner modal content)
+    if (e.target === settingsModal) hide(settingsModal);
   });
 
   // ── Init ──────────────────────────────────────────────

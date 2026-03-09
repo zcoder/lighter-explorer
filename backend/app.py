@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import time
@@ -7,7 +8,12 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.staticfiles import StaticFiles
 import httpx
 
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logger = logging.getLogger(__name__)
+
 LIGHTER_BASE_URL = os.environ.get("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai")
+EXPLORER_BASE_URL = os.environ.get("EXPLORER_BASE_URL", "https://explorer.elliot.ai")
 
 # Derive WS URL from base: https:// → wss://, http:// → ws://, append /stream
 _ws_scheme = "wss://" if LIGHTER_BASE_URL.startswith("https://") else "ws://"
@@ -19,18 +25,26 @@ _cache = {}       # key → (timestamp, data)
 CACHE_TTL = 5.0   # seconds
 
 http_client = None
+explorer_client = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client
+    global http_client, explorer_client
     http_client = httpx.AsyncClient(
         base_url=LIGHTER_BASE_URL,
         timeout=15.0,
         transport=httpx.AsyncHTTPTransport(retries=2),
     )
+    explorer_client = httpx.AsyncClient(
+        base_url=EXPLORER_BASE_URL,
+        timeout=30.0,
+        transport=httpx.AsyncHTTPTransport(retries=1),
+    )
+    logger.info("Lighter Explorer started — upstream=%s, explorer=%s", LIGHTER_BASE_URL, EXPLORER_BASE_URL)
     yield
     await http_client.aclose()
+    await explorer_client.aclose()
 
 
 app = FastAPI(title="Lighter Explorer", lifespan=lifespan)
@@ -57,6 +71,7 @@ async def get_config():
     """Return frontend configuration."""
     return {
         "ws_url": LIGHTER_WS_URL,
+        "explorer_url": EXPLORER_BASE_URL,
     }
 
 
@@ -106,13 +121,54 @@ async def get_account_detail(
     return data
 
 
+@app.get("/api/markets")
+async def get_markets():
+    """Proxy markets list from explorer API (cached)."""
+    cache_key = "_markets_"
+    now = time.monotonic()
+    cached = _cache.get(cache_key)
+    if cached and now - cached[0] < 300:  # 5-minute cache
+        return cached[1]
+
+    resp = await explorer_client.get("/api/markets")
+    if resp.status_code != 200:
+        msg = _lighter_error(resp)
+        raise HTTPException(status_code=resp.status_code, detail=msg)
+
+    data = resp.json()
+    _cache[cache_key] = (now, data)
+    return data
+
+
+@app.get("/api/account-logs/{param}")
+async def get_account_logs(
+    param: str,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """Proxy account logs from explorer API."""
+    if not _ADDRESS_RE.match(param) and not _INDEX_RE.match(param):
+        raise HTTPException(status_code=400, detail="Invalid param format.")
+
+    resp = await explorer_client.get(
+        f"/api/accounts/{param}/logs",
+        params={"limit": str(limit), "offset": str(offset)},
+    )
+    if resp.status_code != 200:
+        msg = _lighter_error(resp)
+        raise HTTPException(status_code=resp.status_code, detail=msg)
+    return resp.json()
+
+
 def _lighter_error(resp) -> str:
     """Extract human-readable error from Lighter API response."""
     try:
         data = resp.json()
-        return data.get("message", "Lighter API error")
+        msg = data.get("message", "Lighter API error")
     except Exception:
-        return "Lighter API error"
+        msg = "Lighter API error"
+    logger.warning("Upstream error %s: %s", resp.status_code, msg)
+    return msg
 
 
 # ── Serve frontend ───────────────────────────────────────────────────

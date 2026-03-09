@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Lighter Explorer</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -19,6 +20,7 @@
         <span class="ws-dot" id="ws-dot"></span>
         <span class="chip-value" id="ws-status-text">Disconnected</span>
       </div>
+      <button id="settings-btn" class="theme-toggle" title="Settings">&#x2699;</button>
     </div>
   </header>
 
@@ -56,6 +58,7 @@
         <div class="field"><span class="label">Pending Orders</span><span id="ma-pending" class="value">—</span></div>
         <div class="field"><span class="label">Trading Subs</span><span id="ma-active-subs" class="value">—</span></div>
         <div class="field"><span class="label">Users Online</span><span id="ma-online" class="value">—</span></div>
+        <div class="field"><span class="label">&nbsp;</span><button class="btn-refresh" id="ma-history" title="View transaction history">History</button></div>
       </div>
     </section>
 
@@ -108,6 +111,35 @@
     <div id="error" class="hidden"></div>
   </main>
 
+  <!-- Account logs modal -->
+  <div id="logs-modal" class="modal-overlay hidden">
+    <div class="modal logs-modal">
+      <div class="logs-header">
+        <h3>Account History <span id="logs-account-id" class="mono"></span></h3>
+        <div class="logs-header-actions">
+          <button id="logs-export-csv" class="btn-export" title="Export history to CSV">&#x2913; CSV</button>
+          <button id="logs-close" class="toast-close" style="font-size:1.3rem">&times;</button>
+        </div>
+      </div>
+      <div id="logs-content" class="logs-scroll">
+        <div id="logs-loading" class="detail-loading hidden"><div class="spinner"></div> Loading...</div>
+        <table id="logs-table" class="positions-table hidden">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Type</th>
+              <th>Details</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="logs-tbody"></tbody>
+        </table>
+        <div id="logs-empty" class="hidden" style="text-align:center;color:var(--text-muted);padding:2rem">No logs found</div>
+      </div>
+      <!-- pagination handled by infinite scroll -->
+    </div>
+  </div>
+
   <!-- Export CSV modal -->
   <div id="export-modal" class="modal-overlay hidden">
     <div class="modal">
@@ -123,6 +155,50 @@
         </button>
       </div>
       <button id="export-cancel" class="modal-cancel">Cancel</button>
+    </div>
+  </div>
+
+  <!-- Settings modal -->
+  <div id="settings-modal" class="modal-overlay hidden">
+    <div class="modal settings-modal">
+      <div class="logs-header">
+        <h3>Settings</h3>
+        <button id="settings-close" class="toast-close" style="font-size:1.3rem">&times;</button>
+      </div>
+      <div class="settings-group">
+        <label class="settings-label">Timezone</label>
+        <div class="settings-options">
+          <button class="settings-opt" data-tz="local">Local</button>
+          <button class="settings-opt" data-tz="utc">UTC</button>
+        </div>
+      </div>
+      <div class="settings-group">
+        <label class="settings-label">Theme</label>
+        <div class="settings-options">
+          <button class="settings-opt" data-theme="auto">Auto</button>
+          <button class="settings-opt" data-theme="light">Light</button>
+          <button class="settings-opt" data-theme="dark">Dark</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Logs export modal -->
+  <div id="logs-export-modal" class="modal-overlay hidden">
+    <div class="modal settings-modal">
+      <h3>Export History</h3>
+      <div class="modal-buttons">
+        <button id="logs-export-full" class="modal-btn">
+          <span class="modal-btn-icon">&#x2913;</span>
+          <span id="logs-export-full-label">Full history</span>
+        </button>
+        <button id="logs-export-loaded" class="modal-btn">
+          <span class="modal-btn-icon">&#x2913;</span>
+          <span id="logs-export-loaded-label">Loaded</span>
+        </button>
+      </div>
+      <div id="logs-export-progress" class="hidden" style="text-align:center;padding:0.5rem 0;color:var(--text-muted);font-size:0.8rem"></div>
+      <button id="logs-export-cancel" class="modal-cancel">Cancel</button>
     </div>
   </div>
 

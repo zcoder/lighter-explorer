@@ -7,6 +7,7 @@
 }
 
 :root {
+  color-scheme: dark;
   --bg: #0d1117;
   --surface: #161b22;
   --border: #30363d;
@@ -16,6 +17,27 @@
   --accent-hover: #79c0ff;
   --green: #3fb950;
   --red: #f85149;
+  --chip-bg: rgba(48, 54, 61, 0.6);
+  --overlay-bg: rgba(0, 0, 0, 0.55);
+  --shadow: rgba(0, 0, 0, 0.4);
+  --bar-bg: rgba(255, 255, 255, 0.1);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f6f8fa;
+  --surface: #ffffff;
+  --border: #d0d7de;
+  --text: #1f2328;
+  --text-muted: #656d76;
+  --accent: #0969da;
+  --accent-hover: #0550ae;
+  --green: #1a7f37;
+  --red: #cf222e;
+  --chip-bg: rgba(208, 215, 222, 0.5);
+  --overlay-bg: rgba(0, 0, 0, 0.3);
+  --shadow: rgba(0, 0, 0, 0.12);
+  --bar-bg: rgba(0, 0, 0, 0.08);
 }
 
 body {
@@ -36,7 +58,7 @@ header {
   justify-content: center;
   position: sticky;
   top: 0;
-  z-index: 100;
+  z-index: 350;
 }
 
 header h1 {
@@ -65,7 +87,7 @@ header h1:hover {
   gap: 0.4rem;
   padding: 0.3rem 0.65rem;
   border-radius: 6px;
-  background: rgba(48, 54, 61, 0.6);
+  background: var(--chip-bg);
   border: 1px solid var(--border);
   font-size: 0.75rem;
   color: var(--text-muted);
@@ -83,6 +105,23 @@ header h1:hover {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   opacity: 0.6;
+}
+
+.theme-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 1.1rem;
+  cursor: pointer;
+  padding: 0.25rem 0.5rem;
+  line-height: 1;
+  transition: color 0.2s, border-color 0.2s;
+}
+
+.theme-toggle:hover {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .chip-value {
@@ -290,7 +329,7 @@ main {
 }
 
 .btn-export {
-  background: rgba(48, 54, 61, 0.6);
+  background: var(--chip-bg);
   color: var(--text-muted);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -312,7 +351,7 @@ main {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--overlay-bg);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -347,7 +386,7 @@ main {
   gap: 0.6rem;
   width: 100%;
   padding: 0.65rem 0.85rem;
-  background: rgba(48, 54, 61, 0.5);
+  background: var(--chip-bg);
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--text);
@@ -528,7 +567,7 @@ tr.detail-row > td {
 }
 
 .btn-refresh {
-  background: rgba(48, 54, 61, 0.6);
+  background: var(--chip-bg);
   color: var(--text-muted);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -609,7 +648,7 @@ tr.detail-row > td {
 .margin-bar {
   margin-top: 4px;
   height: 5px;
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--bar-bg);
   border-radius: 3px;
   overflow: hidden;
 }
@@ -757,7 +796,7 @@ tr.detail-row > td {
   padding: 0.75rem 1rem;
   font-size: 0.85rem;
   color: var(--text);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 4px 12px var(--shadow);
   pointer-events: auto;
   animation: toast-in 0.3s ease-out;
   display: flex;
@@ -835,4 +874,105 @@ tr.detail-row > td {
 
 .live-value {
   transition: color 0.3s ease;
+}
+
+/* ── Logs modal ───────────────────────────────────────── */
+
+.logs-modal {
+  max-width: 780px;
+  width: 92vw;
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.logs-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.logs-header h3 {
+  margin-bottom: 0;
+}
+
+.logs-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.logs-scroll {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 100px;
+}
+
+
+.badge-log {
+  font-size: 0.65rem;
+  padding: 0.1rem 0.4rem;
+  white-space: nowrap;
+}
+
+.log-trade { background: rgba(88, 166, 255, 0.12); color: var(--accent); }
+.log-liq { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+.log-transfer { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+.log-deposit { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+.log-withdraw { background: rgba(210, 153, 34, 0.12); color: #d29922; }
+.log-leverage { background: rgba(139, 148, 158, 0.12); color: var(--text-muted); }
+.log-other { background: rgba(139, 148, 158, 0.12); color: var(--text-muted); }
+
+/* ── Settings modal ──────────────────────────────────── */
+
+#settings-modal,
+#logs-export-modal {
+  z-index: 400;
+}
+
+.settings-modal {
+  max-width: 360px;
+  width: 90vw;
+}
+
+.settings-group {
+  margin-bottom: 1rem;
+}
+
+.settings-label {
+  display: block;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-bottom: 0.4rem;
+}
+
+.settings-options {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.settings-opt {
+  flex: 1;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.settings-opt:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.settings-opt.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
 }
