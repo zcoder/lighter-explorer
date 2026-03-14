@@ -805,6 +805,12 @@ tr.detail-row > td {
   color: var(--accent);
   font-size: 0.9rem;
 }
+.update-banner-link {
+  color: var(--accent);
+  text-decoration: none;
+  transition: opacity 0.15s;
+}
+.update-banner-link:hover { opacity: 0.8; text-decoration: underline; }
 .update-banner-current {
   font-size: 0.7rem;
   color: var(--text-muted);

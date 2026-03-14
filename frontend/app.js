@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.0.8";
+  const APP_VERSION = "0.0.9";
   const GITHUB_REPO = "ivister/lighter-explorer";
 
   // ── DOM references ──────────────────────────────────────
@@ -2189,10 +2189,13 @@
 
       const banner = document.createElement("div");
       banner.className = "update-banner";
+      const releaseUrl = rel.html_url || ("https://github.com/" + GITHUB_REPO + "/releases/tag/" + encodeURIComponent(remoteVer));
       banner.innerHTML =
         '<div class="update-banner-content">' +
           '<div class="update-banner-title">' +
-            '<strong>' + esc(remoteVer) + '</strong> available' +
+            '<a href="' + esc(releaseUrl) + '" target="_blank" rel="noopener" class="update-banner-link">' +
+              '<strong>' + esc(remoteVer) + '</strong> available &#x2197;' +
+            '</a>' +
             '<span class="update-banner-current">current: v' + esc(APP_VERSION) + '</span>' +
           '</div>' +
           '<div class="update-banner-body">' + formatChangelog(rel.body || "") + '</div>' +
