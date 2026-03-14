@@ -1,6 +1,9 @@
 (() => {
   "use strict";
 
+  const APP_VERSION = "0.0.8";
+  const GITHUB_REPO = "ivister/lighter-explorer";
+
   // ── DOM references ──────────────────────────────────────
   const $ = (id) => document.getElementById(id);
 
@@ -2160,10 +2163,72 @@
     if (e.target === settingsModal) hide(settingsModal);
   });
 
+  // ── Version check ───────────────────────────────────────
+
+  function compareVersions(a, b) {
+    const pa = a.replace(/^v/, "").split(".").map(Number);
+    const pb = b.replace(/^v/, "").split(".").map(Number);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const diff = (pb[i] || 0) - (pa[i] || 0);
+      if (diff !== 0) return diff;
+    }
+    return 0;
+  }
+
+  async function checkForUpdates() {
+    try {
+      const dismissed = localStorage.getItem("lighter_dismissed_ver");
+      const resp = await fetch("https://api.github.com/repos/" + GITHUB_REPO + "/releases/latest", {
+        headers: { "Accept": "application/vnd.github.v3+json" }
+      });
+      if (!resp.ok) return;
+      const rel = await resp.json();
+      const remoteVer = rel.tag_name || "";
+      if (!remoteVer || compareVersions(APP_VERSION, remoteVer) <= 0) return;
+      if (dismissed === remoteVer) return;
+
+      const banner = document.createElement("div");
+      banner.className = "update-banner";
+      banner.innerHTML =
+        '<div class="update-banner-content">' +
+          '<div class="update-banner-title">' +
+            '<strong>' + esc(remoteVer) + '</strong> available' +
+            '<span class="update-banner-current">current: v' + esc(APP_VERSION) + '</span>' +
+          '</div>' +
+          '<div class="update-banner-body">' + formatChangelog(rel.body || "") + '</div>' +
+        '</div>' +
+        '<button class="update-banner-close" title="Dismiss">&times;</button>';
+
+      banner.querySelector(".update-banner-close").addEventListener("click", () => {
+        banner.remove();
+        localStorage.setItem("lighter_dismissed_ver", remoteVer);
+      });
+
+      document.body.insertBefore(banner, document.body.firstChild);
+    } catch { /* silent */ }
+  }
+
+  function formatChangelog(md) {
+    // Minimal markdown → HTML for changelog
+    return md
+      .split("\n")
+      .map((line) => {
+        line = line.trim();
+        if (!line) return "";
+        if (line.startsWith("## ")) return '<div class="cl-heading">' + esc(line.slice(3)) + '</div>';
+        if (line.startsWith("- ")) return '<div class="cl-item">&bull; ' + esc(line.slice(2)) + '</div>';
+        if (line.startsWith("* ")) return '<div class="cl-item">&bull; ' + esc(line.slice(2)) + '</div>';
+        return '<div class="cl-item">' + esc(line) + '</div>';
+      })
+      .filter(Boolean)
+      .join("");
+  }
+
   // ── Init ──────────────────────────────────────────────
 
   renderHistory(loadHistory());
   updateSortIndicators();
   initWebSocket();
   loadFromUrlHash();
+  checkForUpdates();
 })();

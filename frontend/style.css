@@ -775,6 +775,68 @@ tr.detail-row > td {
   border-radius: 8px;
 }
 
+/* ── Update banner ─────────────────────────────────────── */
+
+.update-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  background: rgba(88, 166, 255, 0.08);
+  border-bottom: 1px solid rgba(88, 166, 255, 0.25);
+  font-size: 0.82rem;
+  animation: bannerSlide 0.3s ease-out;
+}
+
+@keyframes bannerSlide {
+  from { transform: translateY(-100%); opacity: 0; }
+  to   { transform: translateY(0);     opacity: 1; }
+}
+
+.update-banner-content { flex: 1; min-width: 0; }
+
+.update-banner-title {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+}
+.update-banner-title strong {
+  color: var(--accent);
+  font-size: 0.9rem;
+}
+.update-banner-current {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.update-banner-body {
+  max-height: 120px;
+  overflow-y: auto;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.cl-heading {
+  font-weight: 600;
+  color: var(--text);
+  margin-top: 0.3rem;
+  margin-bottom: 0.15rem;
+}
+.cl-item { padding-left: 0.5rem; }
+
+.update-banner-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 0 0.25rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.update-banner-close:hover { color: var(--text); }
+
 /* ── Toast notifications ───────────────────────────────── */
 
 #toast-container {
