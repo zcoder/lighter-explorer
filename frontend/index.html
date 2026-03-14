@@ -33,7 +33,7 @@
           <input
             id="l1-input"
             type="text"
-            placeholder="0x... or account ID"
+            placeholder="0x..., account ID, or tx hash"
             spellcheck="false"
             autocomplete="off"
             list="l1-history"
@@ -199,6 +199,21 @@
       </div>
       <div id="logs-export-progress" class="hidden" style="text-align:center;padding:0.5rem 0;color:var(--text-muted);font-size:0.8rem"></div>
       <button id="logs-export-cancel" class="modal-cancel">Cancel</button>
+    </div>
+  </div>
+
+  <!-- Transaction modal -->
+  <div id="tx-modal" class="modal-overlay hidden">
+    <div class="modal logs-modal">
+      <div class="logs-header">
+        <h3>Transaction</h3>
+        <button id="tx-close" class="toast-close" style="font-size:1.3rem">&times;</button>
+      </div>
+      <div id="tx-content">
+        <div id="tx-loading" class="detail-loading hidden"><div class="spinner"></div> Loading...</div>
+        <div id="tx-details" class="hidden"></div>
+        <div id="tx-error" class="hidden" style="text-align:center;color:var(--text-muted);padding:2rem">Transaction not found</div>
+      </div>
     </div>
   </div>
 

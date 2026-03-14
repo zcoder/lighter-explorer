@@ -37,6 +37,10 @@
   const logsLoading      = $("logs-loading");
   const logsEmpty        = $("logs-empty");
   const logsExportBtn    = $("logs-export-csv");
+  const txModal          = $("tx-modal");
+  const txDetails        = $("tx-details");
+  const txLoading        = $("tx-loading");
+  const txError          = $("tx-error");
   const settingsModal    = $("settings-modal");
   const logsExportModal    = $("logs-export-modal");
   const logsExportProgress = $("logs-export-progress");
@@ -73,6 +77,7 @@
   let expandGeneration  = {};       // { index: counter } for race condition
 
   let explorerBaseUrl   = "https://explorer.elliot.ai";
+  let currentTxData     = null;   // cached TX for re-render on TZ change
   let logsAccountId     = null;
   let logsOffset        = 0;
   let isLoadingLogs      = false;
@@ -100,6 +105,26 @@
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
+  }
+
+  function syntaxHighlight(obj) {
+    // Parse nested JSON strings (info, event_info)
+    const clean = JSON.parse(JSON.stringify(obj), (k, v) => {
+      if (typeof v === "string" && v.startsWith("{")) { try { return JSON.parse(v); } catch { return v; } }
+      return v;
+    });
+    const json = JSON.stringify(clean, null, 2);
+    return json.replace(/("(\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g, (match) => {
+      let cls = "json-num";
+      if (/^"/.test(match)) {
+        cls = /:$/.test(match) ? "json-key" : "json-str";
+      } else if (/true|false/.test(match)) {
+        cls = "json-bool";
+      } else if (/null/.test(match)) {
+        cls = "json-null";
+      }
+      return '<span class="' + cls + '">' + match + '</span>';
+    });
   }
 
   function formatValue(val) {
@@ -775,6 +800,14 @@
       return esc(marketSymbol(lev.market_index)) + ' &rarr; ' + mult + ' ' + mode;
     }
 
+    // Margin
+    const margin = pd.l2_update_margin_pubdata;
+    if (margin) {
+      const isAdd = margin.direction === 0;
+      const arrow = isAdd ? '<span class="pnl-positive">+</span> ' : '<span class="pnl-negative">&minus;</span> ';
+      return esc(marketSymbol(margin.market_index)) + ' ' + arrow + esc(margin.usdc_amount) + ' USDC';
+    }
+
     // Transfer
     const xfer = pd.l2_transfer_pubdata_v2 || pd.l2_transfer_pubdata;
     if (xfer) {
@@ -783,6 +816,18 @@
         return '<span class="pnl-negative">&rarr;</span> #' + esc(xfer.to_account_index) + ' ' + esc(xfer.amount) + ' ' + esc(xfer.asset_index || "USDC");
       }
       return '<span class="pnl-positive">&larr;</span> #' + esc(xfer.from_account_index) + ' ' + esc(xfer.amount) + ' ' + esc(xfer.asset_index || "USDC");
+    }
+
+    // Deposit
+    const dep = pd.l1_deposit_pubdata;
+    if (dep) {
+      return '<span class="pnl-positive">+</span> ' + esc(dep.amount) + ' ' + esc(dep.asset_index || "USDC");
+    }
+
+    // Withdraw
+    const wd = pd.withdraw_pubdata;
+    if (wd) {
+      return '<span class="pnl-negative">&minus;</span> ' + esc(wd.amount) + ' ' + esc(wd.asset_index || "USDC");
     }
 
     return "—";
@@ -815,7 +860,9 @@
       }
     }
 
-    return '<tr>' +
+    const hashAttr = log.hash ? ' data-tx="' + esc(log.hash) + '"' : '';
+
+    return '<tr class="log-row"' + hashAttr + '>' +
       '<td style="white-space:nowrap" title="' + esc(time.tooltip) + '">' + esc(time.display) + '</td>' +
       '<td>' + badge + '</td>' +
       '<td>' + logDetails(log) + '</td>' +
@@ -947,6 +994,404 @@
     hide(logsLoading);
   }
 
+  // ── Transaction lookup ──────────────────────────────────
+
+  const TX_TYPES = {
+    1:"Deposit", 2:"ChangePubKey (L1)", 3:"CreateMarket", 4:"UpdateMarket",
+    5:"CancelAll (L1)", 6:"Withdraw (L1)", 7:"CreateOrder (L1)",
+    8:"ChangePubKey", 9:"CreateSubAccount", 10:"CreatePool", 11:"UpdatePool",
+    12:"Transfer", 13:"Withdraw", 14:"CreateOrder", 15:"CancelOrder",
+    16:"CancelAllOrders", 17:"ModifyOrder", 18:"MintShares", 19:"BurnShares",
+    20:"UpdateLeverage", 21:"ClaimOrder", 22:"CancelOrder (int)",
+    23:"Deleverage", 24:"ExitPosition", 25:"CancelAll (int)",
+    26:"Liquidation", 27:"CreateOrder (int)", 28:"GroupedOrders",
+    29:"UpdateMargin", 30:"BurnShares (L1)"
+  };
+
+  const TX_STATUSES = {
+    0: ["Failed",   "tx-failed"],
+    1: ["Pending",  "tx-pending"],
+    2: ["Executed", "tx-executed"],
+    3: ["Executed", "tx-executed"]
+  };
+
+  function txTypeBadge(typeNum) {
+    const label = TX_TYPES[typeNum] || ("Type " + typeNum);
+    return '<span class="badge badge-log log-other">' + esc(label) + '</span>';
+  }
+
+  function txStatusBadge(status) {
+    const info = TX_STATUSES[status] || ["Unknown", "tx-pending"];
+    return '<span class="badge badge-log ' + info[1] + '">' + esc(info[0]) + '</span>';
+  }
+
+  function formatTxTime(tsMs) {
+    if (!tsMs) return { display: "—", tooltip: "" };
+    // transaction_time is in microseconds, others in ms
+    const ms = tsMs > 1e15 ? Math.floor(tsMs / 1000) : tsMs;
+    const d = new Date(ms);
+    if (isNaN(d.getTime())) return { display: "—", tooltip: "" };
+    const utcStr = d.toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+    const localStr = d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) + " " +
+      d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    if (settingTz === "utc") {
+      const shown = d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }) + " " +
+        d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit", timeZone: "UTC", hour12: false });
+      return { display: shown, tooltip: localStr + " (local)" };
+    }
+    return { display: localStr, tooltip: utcStr };
+  }
+
+  function parseTxField(val) {
+    if (!val) return {};
+    if (typeof val === "string") { try { return JSON.parse(val); } catch { return {}; } }
+    return val;
+  }
+
+  const ORDER_TYPES = { 0:"Limit", 1:"Market", 2:"Stop Loss", 3:"Stop Loss Limit", 4:"Take Profit", 5:"TP Limit", 6:"TWAP", 7:"TWAP Sub", 8:"Liquidation" };
+  const TIF_LABELS  = { 0:"IOC", 1:"GoodTillTime", 2:"PostOnly" };
+
+  // helpers
+  function txF(label, value, full) {
+    return '<div class="field' + (full ? ' full' : '') + '"><span class="label">' + esc(label) + '</span><span class="value">' + value + '</span></div>';
+  }
+  function txAccLink(index) {
+    return '<a href="#" class="tx-account-link mono" data-index="' + esc(index) + '">#' + esc(index) + '</a>';
+  }
+  function txUsdcAmt(raw) { return (raw / 1e6).toFixed(2) + ' USDC'; }
+  function pick(info, key, ev, abbr) {
+    return info[key] !== undefined ? info[key] : (ev && ev[abbr] !== undefined ? ev[abbr] : undefined);
+  }
+
+  // ── Hero section per tx type ───────────────────────
+  function renderTxHero(tx, info, ev) {
+    const t = tx.type;
+
+    // Transfer (12)
+    if (t === 12) {
+      const from = pick(info, "FromAccountIndex", ev, "fa");
+      const to = pick(info, "ToAccountIndex", ev, "ta");
+      const amt = info.Amount !== undefined ? txUsdcAmt(info.Amount) : (ev.c !== undefined ? txUsdcAmt(ev.c) : "—");
+      return '<div class="tx-hero">' +
+        '<div class="tx-hero-label">Transfer</div>' +
+        '<div class="tx-hero-value">' + esc(amt) + '</div>' +
+        '<div class="tx-hero-sub">' + (from ? txAccLink(from) : '?') + ' <span style="color:var(--text-muted)">&rarr;</span> ' + (to ? txAccLink(to) : '?') + '</div>' +
+      '</div>';
+    }
+
+    // CreateOrder / ModifyOrder / GroupedOrders (14,17,28)
+    if (t === 14 || t === 17 || t === 28) {
+      const isAsk = pick(info, "IsAsk", ev, "ia");
+      const side = isAsk === 0 ? '<span class="pnl-positive">Buy</span>' : '<span class="pnl-negative">Sell</span>';
+      const mkt = pick(info, "MarketIndex", ev, "m");
+      const price = pick(info, "Price", ev, "p");
+      const size = pick(info, "Size", ev, "s");
+      const ot = pick(info, "OrderType", ev, "ot");
+      const otLabel = ot !== undefined ? ORDER_TYPES[ot] || ("Type " + ot) : "";
+      const sym = mkt !== undefined ? marketSymbol(mkt) : "—";
+      const action = t === 17 ? "Modify" : (t === 28 ? "Grouped" : otLabel || "Order");
+      return '<div class="tx-hero">' +
+        '<div class="tx-hero-label">' + esc(action) + '</div>' +
+        '<div class="tx-hero-value">' + side + ' ' + esc(sym) + '</div>' +
+        (price !== undefined ? '<div class="tx-hero-sub">@ ' + esc(price) + (size !== undefined ? ' &times; ' + esc(size) : '') + '</div>' : '') +
+      '</div>';
+    }
+
+    // CancelOrder (15) / CancelAllOrders (16)
+    if (t === 15 || t === 16) {
+      const mkt = pick(info, "MarketIndex", ev, "m");
+      const oi = pick(info, "OrderIndex", ev, "i");
+      const sym = mkt !== undefined ? marketSymbol(mkt) : "";
+      return '<div class="tx-hero">' +
+        '<div class="tx-hero-label">' + (t === 16 ? 'Cancel All Orders' : 'Cancel Order') + '</div>' +
+        '<div class="tx-hero-value">' + (sym ? esc(sym) : '—') + '</div>' +
+        (oi !== undefined ? '<div class="tx-hero-sub">Order #' + esc(oi) + '</div>' : '') +
+      '</div>';
+    }
+
+    // UpdateMargin (29)
+    if (t === 29) {
+      const amt = pick(info, "USDCAmount", ev, "c");
+      const dir = pick(info, "Direction", ev, "d");
+      const mkt = pick(info, "MarketIndex", ev, "m");
+      const dirLabel = dir === 0 ? '<span class="pnl-positive">+ Add</span>' : '<span class="pnl-negative">− Remove</span>';
+      return '<div class="tx-hero">' +
+        '<div class="tx-hero-label">Update Margin</div>' +
+        '<div class="tx-hero-value">' + dirLabel + ' ' + (amt !== undefined ? txUsdcAmt(amt) : '—') + '</div>' +
+        (mkt !== undefined ? '<div class="tx-hero-sub">' + esc(marketSymbol(mkt)) + '</div>' : '') +
+      '</div>';
+    }
+
+    // UpdateLeverage (20)
+    if (t === 20) {
+      const mkt = pick(info, "MarketIndex", ev, "m");
+      const mm = ev.mm;
+      const imf = ev.imf;
+      return '<div class="tx-hero">' +
+        '<div class="tx-hero-label">Update Leverage</div>' +
+        '<div class="tx-hero-value">' + (mkt !== undefined ? esc(marketSymbol(mkt)) : '—') + '</div>' +
+        '<div class="tx-hero-sub">' + (mm !== undefined ? (mm === 0 ? 'Cross' : 'Isolated') : '') + (imf !== undefined ? ' &middot; IMF ' + esc(imf) : '') + '</div>' +
+      '</div>';
+    }
+
+    // Deposit (1) / Withdraw (13,6)
+    if (t === 1 || t === 13 || t === 6) {
+      const amt = pick(info, "USDCAmount", ev, "c") || pick(info, "Amount", ev, "c");
+      return '<div class="tx-hero">' +
+        '<div class="tx-hero-label">' + (t === 1 ? 'Deposit' : 'Withdraw') + '</div>' +
+        '<div class="tx-hero-value">' + (amt !== undefined ? txUsdcAmt(amt) : '—') + '</div>' +
+      '</div>';
+    }
+
+    // MintShares (18) / BurnShares (19,30)
+    if (t === 18 || t === 19 || t === 30) {
+      return '<div class="tx-hero">' +
+        '<div class="tx-hero-label">' + (t === 18 ? 'Mint Shares' : 'Burn Shares') + '</div>' +
+        '<div class="tx-hero-value">' + (TX_TYPES[t] || 'Shares') + '</div>' +
+      '</div>';
+    }
+
+    // CreateSubAccount (9)
+    if (t === 9) {
+      return '<div class="tx-hero">' +
+        '<div class="tx-hero-label">New Sub-Account</div>' +
+        '<div class="tx-hero-value">Create Sub-Account</div>' +
+      '</div>';
+    }
+
+    // Internal ops (21-27) — ClaimOrder, Deleverage, Liquidation, etc.
+    if (t >= 21 && t <= 27) {
+      const mkt = pick(info, "MarketIndex", ev, "m");
+      const trade = ev.t;  // { p, s, tf, mf }
+      const label = TX_TYPES[t] || "Type " + t;
+
+      if (trade && trade.p !== undefined) {
+        // Has trade data — show as trade execution
+        const takerOrd = ev.to;
+        const isAsk = takerOrd ? takerOrd.ia : undefined;
+        const side = isAsk === 0 ? '<span class="pnl-positive">Buy</span>' : (isAsk === 1 ? '<span class="pnl-negative">Sell</span>' : '');
+        const sym = mkt !== undefined ? marketSymbol(mkt) : "—";
+        return '<div class="tx-hero">' +
+          '<div class="tx-hero-label">' + esc(label) + '</div>' +
+          '<div class="tx-hero-value">' + side + (side ? ' ' : '') + esc(sym) + '</div>' +
+          '<div class="tx-hero-sub">@ ' + esc(trade.p) + ' &times; ' + esc(trade.s) + '</div>' +
+        '</div>';
+      }
+
+      return '<div class="tx-hero">' +
+        '<div class="tx-hero-label">Internal</div>' +
+        '<div class="tx-hero-value">' + esc(label) + '</div>' +
+        (mkt !== undefined ? '<div class="tx-hero-sub">' + esc(marketSymbol(mkt)) + '</div>' : '') +
+      '</div>';
+    }
+
+    // Fallback
+    return '<div class="tx-hero">' +
+      '<div class="tx-hero-label">Transaction</div>' +
+      '<div class="tx-hero-value">' + esc(TX_TYPES[t] || 'Type ' + t) + '</div>' +
+    '</div>';
+  }
+
+  // ── Details section per tx type ────────────────────
+  function renderTxTypeDetails(tx, info, ev) {
+    let fields = "";
+    const t = tx.type;
+
+    // Order-specific
+    if (t === 14 || t === 17 || t === 28 || t === 7) {
+      const ot = pick(info, "OrderType", ev, "ot");
+      if (ot !== undefined) fields += txF("Order Type", esc(ORDER_TYPES[ot] || ot));
+      const tif = pick(info, "TimeInForce", ev, "f");
+      if (tif !== undefined) fields += txF("Time in Force", esc(TIF_LABELS[tif] || tif));
+      const ro = pick(info, "ReduceOnly", ev, "ro");
+      if (ro !== undefined) fields += txF("Reduce Only", ro ? "Yes" : "No");
+      const tp = pick(info, "TriggerPrice", ev, "tp");
+      if (tp !== undefined && tp !== 0 && tp !== "0") fields += txF("Trigger Price", esc(tp));
+      if (ev.is !== undefined) fields += txF("Initial Size", esc(ev.is));
+      if (ev.rs !== undefined) fields += txF("Remaining Size", esc(ev.rs));
+      const oi = pick(info, "OrderIndex", ev, "i");
+      if (oi !== undefined) fields += txF("Order Index", '<span class="mono">' + esc(oi) + '</span>');
+    }
+
+    // Cancel-specific
+    if (t === 15) {
+      const oi = pick(info, "OrderIndex", ev, "i");
+      if (oi !== undefined) fields += txF("Order Index", '<span class="mono">' + esc(oi) + '</span>');
+    }
+
+    // Transfer-specific
+    if (t === 12) {
+      const fee = info.USDCFee !== undefined ? info.USDCFee : ev.uf;
+      if (fee !== undefined && fee !== 0) fields += txF("Fee", txUsdcAmt(fee));
+      const asset = info.AssetIndex;
+      if (asset !== undefined) fields += txF("Asset", esc(asset));
+    }
+
+    // Margin/Leverage
+    if (t === 29) {
+      if (ev.mm !== undefined) fields += txF("Margin Mode", ev.mm === 0 ? "Cross" : "Isolated");
+    }
+    if (t === 20) {
+      const mkt = pick(info, "MarketIndex", ev, "m");
+      if (mkt !== undefined) fields += txF("Market", esc(marketSymbol(mkt)));
+    }
+
+    // Fees (top-level)
+    if (ev.tf !== undefined && !ev.t) fields += txF("Taker Fee", esc(ev.tf));
+    if (ev.mf !== undefined && !ev.t) fields += txF("Maker Fee", esc(ev.mf));
+
+    // Internal trade ops (21-27)
+    if (t >= 21 && t <= 27) {
+      const trade = ev.t;
+      if (trade) {
+        if (trade.tf !== undefined) fields += txF("Taker Fee", esc(trade.tf));
+        if (trade.mf !== undefined) fields += txF("Maker Fee", esc(trade.mf));
+      }
+    }
+
+    if (!fields) { /* may still have order sections below */ }
+
+    let sections = "";
+    if (fields) {
+      sections += '<div class="tx-section">' +
+        '<div class="tx-section-title">Details</div>' +
+        '<div class="tx-grid">' + fields + '</div>' +
+      '</div>';
+    }
+
+    // Maker / Taker order cards for internal ops
+    if (t >= 21 && t <= 27) {
+      const mo = ev.mo;
+      const to = ev.to;
+      if (mo || to) {
+        const renderOrd = (ord, label) => {
+          if (!ord) return "";
+          const side = ord.ia === 0 ? '<span class="pnl-positive">Buy</span>' : '<span class="pnl-negative">Sell</span>';
+          const ot = ORDER_TYPES[ord.ot] || ord.ot;
+          const tif = TIF_LABELS[ord.f] || ord.f;
+          const st = ord.st === 2 ? "Filled" : (ord.st === 3 ? "Closed" : (ord.st === 1 ? "Open" : "st:" + ord.st));
+          let r = '<div class="tx-section">' +
+            '<div class="tx-section-title">' + label + '</div>' +
+            '<div class="tx-grid">';
+          r += txF("Side", side);
+          r += txF("Order Type", esc(ot));
+          if (ord.p !== undefined) r += txF("Price", esc(ord.p));
+          r += txF("Status", esc(st));
+          if (ord.is !== undefined) r += txF("Initial Size", esc(ord.is));
+          if (ord.rs !== undefined) r += txF("Remaining", esc(ord.rs));
+          if (ord.a !== undefined) r += txF("Account", txAccLink(ord.a));
+          if (tif) r += txF("TIF", esc(tif));
+          if (ord.i !== undefined) r += txF("Order ID", '<span class="mono">' + esc(ord.i) + '</span>');
+          if (ord.ro) r += txF("Reduce Only", "Yes");
+          r += '</div></div>';
+          return r;
+        };
+        sections += renderOrd(mo, "Maker Order");
+        sections += renderOrd(to, "Taker Order");
+      }
+    }
+
+    return sections;
+  }
+
+  let txRawVisible = false;
+
+  function renderTxDetails(tx) {
+    const hash = tx.hash || "";
+    const info = parseTxField(tx.info);
+    const ev = parseTxField(tx.event_info);
+    const time = formatTxTime(tx.executed_at || tx.transaction_time || tx.queued_at);
+    const shortHash = hash.slice(0, 10) + "\u2026" + hash.slice(-8);
+
+    let html = '<div class="tx-card">';
+
+    // ── Header: type + status + hash ─────────────
+    html += '<div class="tx-header">' +
+      txTypeBadge(tx.type) + txStatusBadge(tx.status) +
+      '<span class="tx-hash-display copy-target" data-copy="' + esc(hash) + '" title="Click to copy full hash">' + esc(shortHash) + '</span>' +
+    '</div>';
+
+    // ── Hero ──────────────────────────────────────
+    html += renderTxHero(tx, info, ev);
+
+    // ── Error banner ─────────────────────────────
+    if (ev.ae && ev.ae !== "") {
+      html += '<div class="tx-error-banner">\u26A0 ' + esc(ev.ae) + '</div>';
+    }
+
+    // ── Type-specific details ────────────────────
+    html += renderTxTypeDetails(tx, info, ev);
+
+    // ── Meta info ────────────────────────────────
+    let meta = "";
+    if (tx.account_index) meta += txF("Account", txAccLink(tx.account_index));
+    if (tx.l1_address) meta += txF("L1 Address", '<span class="mono" style="font-size:0.72rem">' + esc(tx.l1_address) + '</span>', true);
+    if (tx.block_height) meta += txF("Block", Number(tx.block_height).toLocaleString());
+    meta += txF("Time", '<span title="' + esc(time.tooltip) + '">' + esc(time.display) + '</span>');
+    if (tx.nonce !== undefined) meta += txF("Nonce", esc(tx.nonce));
+    if (tx.parent_hash) {
+      const ph = tx.parent_hash;
+      const shortPh = ph.slice(0, 10) + "\u2026" + ph.slice(-8);
+      meta += txF("Parent TX", '<a href="#" class="tx-hash-link mono" data-hash="' + esc(ph) + '">' + esc(shortPh) + '</a>');
+    }
+
+    html += '<div class="tx-section">' +
+      '<div class="tx-section-title">Transaction Info</div>' +
+      '<div class="tx-grid">' + meta + '</div>' +
+    '</div>';
+
+    // ── Raw JSON toggle ──────────────────────────
+    html += '<div class="tx-section" style="border-bottom:none">' +
+      '<button class="btn-export tx-raw-toggle" style="font-size:0.75rem">{} JSON</button>' +
+      '<pre class="tx-raw-json' + (txRawVisible ? '' : ' hidden') + '">' +
+      syntaxHighlight(tx) + '</pre>' +
+    '</div>';
+
+    html += '</div>';
+    txDetails.innerHTML = html;
+  }
+
+  function rerenderTx() {
+    if (!currentTxData || txModal.classList.contains("hidden")) return;
+    renderTxDetails(currentTxData);
+  }
+
+  async function openTxModal(hash) {
+    show(txModal);
+    show(txLoading);
+    hide(txDetails);
+    hide(txError);
+    txDetails.innerHTML = "";
+    currentTxData = null;
+    txRawVisible = false;
+
+    await fetchMarkets();
+
+    try {
+      const resp = await fetch("/api/tx?hash=" + encodeURIComponent(hash));
+      if (!resp.ok) throw new Error("not found");
+      const tx = await resp.json();
+      hide(txLoading);
+
+      currentTxData = tx;
+      renderTxDetails(tx);
+      show(txDetails);
+    } catch {
+      hide(txLoading);
+      show(txError);
+    }
+  }
+
+  function closeTxModal() {
+    hide(txModal);
+    txDetails.innerHTML = "";
+    hide(txDetails);
+    hide(txError);
+    hide(txLoading);
+    currentTxData = null;
+    txRawVisible = false;
+  }
+
   // ── Logs CSV export ─────────────────────────────────────
 
   function logCsvRow(log) {
@@ -970,6 +1415,13 @@
       leverage = lev.initial_margin_fraction > 0 ? Math.round(10000 / lev.initial_margin_fraction) + "x" : "";
     }
 
+    const mgn = pd.l2_update_margin_pubdata;
+    if (mgn) {
+      market = marketSymbol(mgn.market_index);
+      direction = mgn.direction === 0 ? "add" : "remove";
+      amount = mgn.usdc_amount || "";
+    }
+
     const xfer = pd.l2_transfer_pubdata_v2 || pd.l2_transfer_pubdata;
     if (xfer) {
       const isFrom = String(xfer.from_account_index) === String(logsAccountId);
@@ -977,12 +1429,18 @@
       amount = xfer.amount || "";
     }
 
-    return [time, type, side, market, price, size, leverage, direction, amount, log.status || ""]
+    const dep = pd.l1_deposit_pubdata;
+    if (dep) { direction = "deposit"; amount = dep.amount || ""; }
+
+    const wd = pd.withdraw_pubdata;
+    if (wd) { direction = "withdraw"; amount = wd.amount || ""; }
+
+    return [time, type, side, market, price, size, leverage, direction, amount, log.status || "", log.hash || ""]
       .map(csvEscape).join(",");
   }
 
   function downloadLogsCsv(logs) {
-    const header = "time,type,side,market,price,size,leverage,transfer,amount,status";
+    const header = "time,type,side,market,price,size,leverage,transfer,amount,status,hash";
     const rows = [header].concat(logs.map(logCsvRow));
     const blob = new Blob([rows.join("\n")], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
@@ -1399,12 +1857,14 @@
     saveToHistory(val);
     updateUrlHash(val);
 
-    if (val.startsWith("0x")) {
+    if (/^[0-9a-fA-F]{40,80}$/.test(val) && !val.startsWith("0x")) {
+      openTxModal(val);
+    } else if (val.startsWith("0x")) {
       loadAddress(val);
     } else if (/^\d+$/.test(val)) {
       loadAccountById(val);
     } else {
-      errorEl.textContent = "Invalid input. Enter a 0x... L1 address or a numeric account ID.";
+      errorEl.textContent = "Invalid input. Enter a 0x... L1 address, account ID, or tx hash.";
       show(errorEl);
     }
   }
@@ -1560,6 +2020,10 @@
   // Logs modal
   $("logs-close").addEventListener("click", closeLogsModal);
   logsModal.addEventListener("click", (e) => { if (e.target === logsModal) closeLogsModal(); });
+  logsTbody.addEventListener("click", (e) => {
+    const row = e.target.closest("tr[data-tx]");
+    if (row) openTxModal(row.dataset.tx);
+  });
   $("logs-content").addEventListener("scroll", (e) => {
     const el = e.target;
     if (el.scrollTop + el.clientHeight >= el.scrollHeight - 60) {
@@ -1583,8 +2047,46 @@
   $("logs-export-cancel").addEventListener("click", () => hide(logsExportModal));
   logsExportModal.addEventListener("click", (e) => { if (e.target === logsExportModal) hide(logsExportModal); });
 
+  // TX modal
+  $("tx-close").addEventListener("click", closeTxModal);
+  txModal.addEventListener("click", (e) => { if (e.target === txModal) closeTxModal(); });
+  txDetails.addEventListener("click", (e) => {
+    // Click-to-copy hash
+    const copyEl = e.target.closest(".copy-target");
+    if (copyEl && copyEl.dataset.copy) {
+      navigator.clipboard.writeText(copyEl.dataset.copy).then(() => showToast("Copied", "", "info"));
+      return;
+    }
+    // Account link
+    const accLink = e.target.closest(".tx-account-link");
+    if (accLink) {
+      e.preventDefault();
+      closeTxModal();
+      input.value = accLink.dataset.index;
+      doSearch();
+      return;
+    }
+    // Parent tx link
+    const txLink = e.target.closest(".tx-hash-link");
+    if (txLink) {
+      e.preventDefault();
+      openTxModal(txLink.dataset.hash);
+      return;
+    }
+    // Raw JSON toggle
+    const rawBtn = e.target.closest(".tx-raw-toggle");
+    if (rawBtn) {
+      const pre = txDetails.querySelector(".tx-raw-json");
+      if (pre) {
+        txRawVisible = !txRawVisible;
+        pre.classList.toggle("hidden", !txRawVisible);
+      }
+    }
+  });
+
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
+    if (!txModal.classList.contains("hidden")) { closeTxModal(); return; }
     if (!logsExportModal.classList.contains("hidden")) { hide(logsExportModal); return; }
     if (!settingsModal.classList.contains("hidden")) { hide(settingsModal); return; }
     if (!logsModal.classList.contains("hidden")) closeLogsModal();
@@ -1643,6 +2145,7 @@
       localStorage.setItem("lighter_tz", settingTz);
       updateSettingsUI();
       rerenderLogs();
+      rerenderTx();
       return;
     }
     const themeBtn = e.target.closest("[data-theme]");

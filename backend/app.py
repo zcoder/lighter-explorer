@@ -160,6 +160,22 @@ async def get_account_logs(
     return resp.json()
 
 
+_TX_HASH_RE = re.compile(r"^[0-9a-fA-F]{40,80}$")
+
+
+@app.get("/api/tx")
+async def get_tx(hash: str = Query(..., alias="hash")):
+    """Proxy transaction lookup from Lighter API."""
+    if not _TX_HASH_RE.match(hash):
+        raise HTTPException(status_code=400, detail="Invalid tx hash format.")
+
+    resp = await http_client.get("/api/v1/tx", params={"by": "hash", "value": hash})
+    if resp.status_code != 200:
+        msg = _lighter_error(resp)
+        raise HTTPException(status_code=resp.status_code, detail=msg)
+    return resp.json()
+
+
 def _lighter_error(resp) -> str:
     """Extract human-readable error from Lighter API response."""
     try:
