@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.1.0";
+  const APP_VERSION = "0.1.1";
   const GITHUB_REPO = "ivister/lighter-explorer";
 
   // ── DOM references ──────────────────────────────────────
@@ -1978,10 +1978,15 @@
     historyDropdown.innerHTML = html;
   }
 
-  function showHistory() {
+  function showHistory(filter) {
     const h = loadHistory();
-    if (!h.l1.length && !h.index.length) return;
-    renderHistory(h);
+    const q = (filter || "").toLowerCase();
+    const filtered = {
+      l1: q ? h.l1.filter((e) => e.addr.toLowerCase().includes(q) || (e.index != null && String(e.index).includes(q))) : h.l1,
+      index: q ? h.index.filter((e) => String(e.id).includes(q) || (e.l1 && e.l1.toLowerCase().includes(q))) : h.index
+    };
+    if (!filtered.l1.length && !filtered.index.length) { hideHistory(); return; }
+    renderHistory(filtered);
     show(historyDropdown);
   }
 
@@ -2159,7 +2164,8 @@
     if (e.key === "Enter") { e.preventDefault(); doSearch(); }
     else if (e.key === "Escape") { hideHistory(); input.blur(); }
   });
-  input.addEventListener("focus", showHistory);
+  input.addEventListener("focus", () => showHistory(input.value.trim()));
+  input.addEventListener("input", () => showHistory(input.value.trim()));
   document.addEventListener("mousedown", (e) => {
     if (!historyDropdown.contains(e.target) && e.target !== input) hideHistory();
   });
