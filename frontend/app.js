@@ -1125,8 +1125,26 @@
       '</div>';
     }
 
-    // CreateOrder / ModifyOrder / GroupedOrders (14,17,28)
-    if (t === 14 || t === 17 || t === 28) {
+    // GroupedOrders (28) — hero from first order in Orders[]
+    if (t === 28) {
+      const orders = Array.isArray(info.Orders) ? info.Orders : [];
+      const main = orders[0] || {};
+      const mkt = main.MarketIndex !== undefined ? main.MarketIndex : (ev.m !== undefined ? ev.m : undefined);
+      const sym = mkt !== undefined ? marketSymbol(mkt) : "—";
+      const side = formatSide(main.IsAsk);
+      const gt = info.GroupingType !== undefined ? info.GroupingType : ev.gt;
+      const gtLabel = GROUPING_TYPES[gt] || ("Group " + gt);
+      const otLabel = main.Type !== undefined ? (ORDER_TYPES[main.Type] || ("Type " + main.Type)) : "";
+      const subOrders = orders.slice(1).map(o => ORDER_TYPES[o.Type] || "").filter(Boolean).join(" + ");
+      return '<div class="tx-hero">' +
+        '<div class="tx-hero-label">' + esc(gtLabel) + (subOrders ? ' (' + esc(subOrders) + ')' : '') + '</div>' +
+        '<div class="tx-hero-value">' + side + ' ' + esc(sym) + '</div>' +
+        (main.Price !== undefined ? '<div class="tx-hero-sub">@ ' + esc(main.Price) + (main.BaseAmount ? ' &times; ' + esc(main.BaseAmount) : '') + '</div>' : '') +
+      '</div>';
+    }
+
+    // CreateOrder / ModifyOrder (14,17)
+    if (t === 14 || t === 17) {
       const isAsk = pick(info, "IsAsk", ev, "ia");
       const side = formatSide(isAsk);
       const mkt = pick(info, "MarketIndex", ev, "m");
@@ -1135,7 +1153,7 @@
       const ot = pick(info, ["OrderType","Type"], ev, "ot");
       const otLabel = ot !== undefined ? ORDER_TYPES[ot] || ("Type " + ot) : "";
       const sym = mkt !== undefined ? marketSymbol(mkt) : "—";
-      const action = t === 17 ? "Modify" : (t === 28 ? "Grouped" : otLabel || "Order");
+      const action = t === 17 ? "Modify" : otLabel || "Order";
       return '<div class="tx-hero">' +
         '<div class="tx-hero-label">' + esc(action) + '</div>' +
         '<div class="tx-hero-value">' + side + ' ' + esc(sym) + '</div>' +
@@ -1243,8 +1261,8 @@
     let fields = "";
     const t = tx.type;
 
-    // Order-specific
-    if (t === 14 || t === 17 || t === 28 || t === 7) {
+    // Order-specific (CreateOrder=14, ModifyOrder=17, L1CreateOrder=7)
+    if (t === 14 || t === 17 || t === 7) {
       const ot = info.OrderType !== undefined ? info.OrderType : (info.Type !== undefined ? info.Type : (ev && ev.ot !== undefined ? ev.ot : undefined));
       if (ot !== undefined) fields += txF("Order Type", esc(ORDER_TYPES[ot] || ot));
       const mkt = pick(info, "MarketIndex", ev, "m");
@@ -1283,10 +1301,116 @@
         if (trade.tf !== undefined) fields += txF("Taker Fee", esc(trade.tf));
         if (trade.mf !== undefined) fields += txF("Maker Fee", esc(trade.mf));
       }
-      // GroupingType for grouped orders
-      if (t === 28 && info.GroupingType !== undefined) {
-        fields += txF("Grouping", esc(GROUPING_TYPES[info.GroupingType] || info.GroupingType));
+    }
+
+    // GroupedOrders (28) — dedicated rendering
+    if (t === 28) {
+      const orders = Array.isArray(info.Orders) ? info.Orders : [];
+      const gt = info.GroupingType !== undefined ? info.GroupingType : ev.gt;
+      const mkt = orders[0]?.MarketIndex !== undefined ? orders[0].MarketIndex : ev.m;
+      const indices = Array.isArray(ev.i) ? ev.i : [];
+
+      // Summary fields
+      if (gt !== undefined) fields += txF("Grouping Type", esc(GROUPING_TYPES[gt] || ("Type " + gt)));
+      if (mkt !== undefined) fields += txF("Market", esc(marketSymbol(mkt)));
+
+      // AppError at group level
+      if (ev.ae && ev.ae !== "") fields += txF("Error", '<span style="color:var(--pnl-neg)">' + esc(ev.ae) + '</span>');
+
+      let sections2 = "";
+
+      // Render each order card
+      orders.forEach((ord, idx) => {
+        const orderType = ord.Type !== undefined ? ORDER_TYPES[ord.Type] || ("Type " + ord.Type) : "—";
+        // Determine label
+        let label;
+        if (idx === 0) label = orderType + " (Main)";
+        else if (ord.Type === 4 || ord.Type === 5) label = "Take Profit";
+        else if (ord.Type === 2 || ord.Type === 3) label = "Stop Loss";
+        else label = orderType;
+
+        const ordIdx = indices[idx];
+        let r = '<div class="tx-section">';
+        r += '<div class="tx-section-title">' + esc(label) + '</div>';
+        r += '<div class="tx-grid">';
+        r += txF("Side", formatSide(ord.IsAsk));
+        r += txF("Order Type", esc(orderType));
+        if (ord.Price !== undefined) r += txF("Price", esc(ord.Price));
+        if (ord.BaseAmount !== undefined && ord.BaseAmount !== 0) r += txF("Size", esc(ord.BaseAmount));
+        if (ord.TriggerPrice !== undefined && ord.TriggerPrice !== 0) r += txF("Trigger Price", esc(ord.TriggerPrice));
+        if (ord.TimeInForce !== undefined) r += txF("TIF", esc(TIF_LABELS[ord.TimeInForce] || ord.TimeInForce));
+        if (ord.ReduceOnly) r += txF("Reduce Only", "Yes");
+        if (ord.OrderExpiry && ord.OrderExpiry !== 0) r += txF("Expiry", esc(ord.OrderExpiry));
+        if (ordIdx !== undefined) r += txF("Order Index", '<span class="mono">' + esc(ordIdx) + '</span>');
+        r += '</div></div>';
+        sections2 += r;
+      });
+
+      // OrderExecution from ev.oe (trade that happened at submission)
+      const oe = ev.oe;
+      if (oe) {
+        const oeMkt = oe.m !== undefined ? oe.m : mkt;
+        const trade = oe.t;
+        const oeTo = oe.to;
+        const oeMo = oe.mo;
+
+        if (trade && (trade.p || trade.s)) {
+          let r = '<div class="tx-section">';
+          r += '<div class="tx-section-title">Execution</div>';
+          r += '<div class="tx-grid">';
+          if (trade.p !== undefined && trade.p !== 0) r += txF("Fill Price", esc(trade.p));
+          if (trade.s !== undefined && trade.s !== 0) r += txF("Fill Size", esc(trade.s));
+          if (trade.tf !== undefined) r += txF("Taker Fee", esc(trade.tf));
+          if (trade.mf !== undefined) r += txF("Maker Fee", esc(trade.mf));
+          r += '</div></div>';
+          sections2 += r;
+        }
+
+        // Taker order (submitted order) state
+        if (oeTo && oeTo.i) {
+          let r = '<div class="tx-section">';
+          r += '<div class="tx-section-title">Taker Order</div>';
+          r += '<div class="tx-grid">';
+          r += txF("Side", formatSide(oeTo.ia));
+          r += txF("Order Type", esc(ORDER_TYPES[oeTo.ot] || oeTo.ot));
+          if (oeTo.p) r += txF("Price", esc(oeTo.p));
+          if (oeTo.is !== undefined) r += txF("Initial Size", esc(oeTo.is));
+          if (oeTo.rs !== undefined) r += txF("Remaining Size", esc(oeTo.rs));
+          if (oeTo.st !== undefined) r += txF("Status", esc(ORDER_STATUSES[oeTo.st] || oeTo.st));
+          if (oeTo.ts !== undefined && oeTo.ts !== 0) r += txF("Trigger Status", esc(oeTo.ts));
+          if (oeTo.i) r += txF("Order Index", '<span class="mono">' + esc(oeTo.i) + '</span>');
+          if (oeTo.c0 && oeTo.c0 !== 0) r += txF("Cancel Order Index", '<span class="mono">' + esc(oeTo.c0) + '</span>');
+          r += '</div></div>';
+          sections2 += r;
+        }
+
+        // Maker order (counterparty)
+        if (oeMo && oeMo.i) {
+          let r = '<div class="tx-section">';
+          r += '<div class="tx-section-title">Maker Order</div>';
+          r += '<div class="tx-grid">';
+          r += txF("Side", formatSide(oeMo.ia));
+          if (oeMo.p) r += txF("Price", esc(oeMo.p));
+          if (oeMo.is !== undefined) r += txF("Initial Size", esc(oeMo.is));
+          if (oeMo.rs !== undefined) r += txF("Remaining Size", esc(oeMo.rs));
+          if (oeMo.st !== undefined) r += txF("Status", esc(ORDER_STATUSES[oeMo.st] || oeMo.st));
+          if (oeMo.a !== undefined) r += txF("Account", txAccLink(oeMo.a));
+          if (oeMo.i) r += txF("Order Index", '<span class="mono">' + esc(oeMo.i) + '</span>');
+          r += '</div></div>';
+          sections2 += r;
+        }
       }
+
+      // Build final HTML - summary section first, then order cards
+      let result = "";
+      if (fields) {
+        result += '<div class="tx-section">' +
+          '<div class="tx-section-title">Details</div>' +
+          '<div class="tx-grid">' + fields + '</div>' +
+          '</div>';
+      }
+      result += sections2;
+      return result;
     }
 
     // Cancel-specific
@@ -1466,9 +1590,9 @@
 
     // ── Raw JSON toggle ──────────────────────────
     html += '<div class="tx-section" style="border-bottom:none">' +
-      '<div style="display:flex;gap:0.5rem;align-items:center">' +
+      '<div class="tx-json-toolbar">' +
       '<button class="btn-export tx-raw-toggle" style="font-size:0.75rem">{} JSON</button>' +
-      '<button class="btn-export tx-copy-json" style="font-size:0.75rem">Copy</button>' +
+      '<button class="btn-export tx-copy-json" style="font-size:0.75rem">⎘ Copy</button>' +
       '</div>' +
       '<pre class="tx-raw-json' + (txRawVisible ? '' : ' hidden') + '">' +
       syntaxHighlight(tx) + '</pre>' +
