@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.1.6";
+  const APP_VERSION = "0.1.7";
   const GITHUB_REPO = "ivister/lighter-explorer";
 
   // ── DOM references ──────────────────────────────────────
@@ -1407,6 +1407,11 @@
     if (ord.u  !== undefined)               g += txF("Client Order ID",'<span class="mono">' + esc(ord.u)  + '</span>');
     if (ord.ro)                             g += txF("Reduce Only",    "Yes");
     if (ord.tp !== undefined && ord.tp !==0) g += txF("Trigger Price",  fmtPx(ord.tp, mkt) || esc(ord.tp));
+    // Integrator fee
+    if (ord.ifci && (ord.itf || ord.imf)) {
+      const feeAmt = (ord.itf || 0) + (ord.imf || 0);
+      g += txF("Integrator Fee", fmtFee(feeAmt) + ' → ' + txAccLink(ord.ifci));
+    }
     g += '</div>';
     return g;
   }
@@ -1455,6 +1460,11 @@
         if (trade.s !== undefined) fields += txF("Fill Size", fmtSz(trade.s, mktForFmt) || esc(trade.s));
         // Always show our fee (taker), even if 0
         if (trade.tf !== undefined) fields += txF("Fee (Taker)", fmtFee(trade.tf));
+      }
+      // Integrator fee (from taker order)
+      if (to && to.ifci && (to.itf || to.imf)) {
+        const intFee = (to.itf || 0) + (to.imf || 0);
+        fields += txF("Integrator Fee", fmtFee(intFee) + ' → ' + txAccLink(to.ifci));
       }
     }
 
@@ -2921,6 +2931,27 @@
   loadFromUrlHash();
   checkForUpdates();
 
-  // Pause market_stats stream when tab is hidden, resume on visibility
-  document.addEventListener("visibilitychange", () => syncMarketStatsSub());
+  // Pause market_stats when tab hidden; disconnect WS entirely after 5 min idle
+  const IDLE_DISCONNECT_MS = 5 * 60 * 1000;
+  let idleDisconnectTimer = null;
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      // Start idle countdown — disconnect WS if tab stays hidden
+      if (!idleDisconnectTimer) {
+        idleDisconnectTimer = setTimeout(() => {
+          WS.pause();
+          idleDisconnectTimer = null;
+        }, IDLE_DISCONNECT_MS);
+      }
+    } else {
+      // Tab visible again — cancel timer and reconnect if paused
+      if (idleDisconnectTimer) {
+        clearTimeout(idleDisconnectTimer);
+        idleDisconnectTimer = null;
+      }
+      WS.resume();
+    }
+    syncMarketStatsSub();
+  });
 })();

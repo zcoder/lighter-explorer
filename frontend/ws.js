@@ -11,6 +11,7 @@
 
   var subs = {};            // channel (with /) → callback
   var statusCallbacks = [];
+  var paused = false;
 
   // ── Public API ──────────────────────────────────────────
 
@@ -75,12 +76,33 @@
   }
 
   function scheduleReconnect() {
+    if (paused) return;
     if (reconnectTimer) return;
     reconnectTimer = setTimeout(function () {
       reconnectTimer = null;
       reconnectDelay = Math.min(reconnectDelay * 2, MAX_DELAY);
       connect();
     }, reconnectDelay);
+  }
+
+  // Disconnect and stop auto-reconnect (subscriptions kept in memory)
+  function pause() {
+    paused = true;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    stopPing();
+    if (ws) {
+      ws.onclose = null;
+      ws.close();
+      ws = null;
+    }
+    setConnected(false);
+  }
+
+  // Resume: reconnect and resubscribe all channels
+  function resume() {
+    paused = false;
+    reconnectDelay = 1000;
+    connect();
   }
 
   // ── Heartbeat ───────────────────────────────────────────
@@ -162,5 +184,7 @@
     unsubscribe: unsubscribe,
     onStatusChange: onStatusChange,
     destroy: destroy,
+    pause: pause,
+    resume: resume,
   };
 })();
