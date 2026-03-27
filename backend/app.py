@@ -17,6 +17,7 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
 
 LIGHTER_BASE_URL = os.environ.get("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai")
+LIGHTER_MAINNET_URL = "https://mainnet.zklighter.elliot.ai"
 EXPLORER_BASE_URL = os.environ.get("EXPLORER_BASE_URL", "https://explorer.elliot.ai")
 
 _ws_scheme = "wss://" if LIGHTER_BASE_URL.startswith("https://") else "ws://"
@@ -29,6 +30,7 @@ CACHE_TTL = 5.0   # seconds
 
 http_client = None
 explorer_client = None
+fallback_client = None
 
 
 # ── WebSocket proxy ───────────────────────────────────────────────────
@@ -211,9 +213,21 @@ ws_proxy = LighterWSProxy(LIGHTER_WS_URL)
 
 # ── App lifecycle ─────────────────────────────────────────────────────
 
+_has_fallback = LIGHTER_BASE_URL.rstrip("/") != LIGHTER_MAINNET_URL.rstrip("/")
+
+
+async def lighter_get(path: str, **kwargs) -> httpx.Response:
+    """GET from primary upstream; on 403 fall back to mainnet if configured differently."""
+    resp = await http_client.get(path, **kwargs)
+    if resp.status_code == 403 and _has_fallback and fallback_client:
+        logger.info("Primary returned 403 for %s, trying mainnet fallback", path)
+        resp = await fallback_client.get(path, **kwargs)
+    return resp
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client, explorer_client
+    global http_client, explorer_client, fallback_client
     http_client = httpx.AsyncClient(
         base_url=LIGHTER_BASE_URL,
         timeout=15.0,
@@ -224,11 +238,21 @@ async def lifespan(app: FastAPI):
         timeout=30.0,
         transport=httpx.AsyncHTTPTransport(retries=1),
     )
+    fallback_client = None
+    if _has_fallback:
+        fallback_client = httpx.AsyncClient(
+            base_url=LIGHTER_MAINNET_URL,
+            timeout=15.0,
+            transport=httpx.AsyncHTTPTransport(retries=1),
+        )
+        logger.info("Fallback client enabled → %s", LIGHTER_MAINNET_URL)
     ws_proxy.start()
     logger.info("Lighter Explorer started — upstream=%s, explorer=%s", LIGHTER_BASE_URL, EXPLORER_BASE_URL)
     yield
     await http_client.aclose()
     await explorer_client.aclose()
+    if fallback_client:
+        await fallback_client.aclose()
 
 
 app = FastAPI(title="Lighter Explorer", lifespan=lifespan)
@@ -285,7 +309,7 @@ async def get_account_detail(
     if cached and now - cached[0] < CACHE_TTL:
         return cached[1]
 
-    resp = await http_client.get("/api/v1/account", params={"by": by, "value": value})
+    resp = await lighter_get("/api/v1/account", params={"by": by, "value": value})
     if resp.status_code != 200:
         msg = _lighter_error(resp)
         raise HTTPException(status_code=resp.status_code, detail=msg)
@@ -327,7 +351,7 @@ async def get_contracts():
     if cached and now - cached[0] < 600:
         return cached[1]
 
-    resp = await http_client.get("/api/v1/orderBookDetails?filter=all")
+    resp = await lighter_get("/api/v1/orderBookDetails?filter=all")
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="upstream error")
 
@@ -376,7 +400,7 @@ async def get_tx(hash: str = Query(..., alias="hash")):
     if not _TX_HASH_RE.match(hash):
         raise HTTPException(status_code=400, detail="Invalid tx hash format.")
 
-    resp = await http_client.get("/api/v1/tx", params={"by": "hash", "value": hash})
+    resp = await lighter_get("/api/v1/tx", params={"by": "hash", "value": hash})
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=_lighter_error(resp))
     return resp.json()

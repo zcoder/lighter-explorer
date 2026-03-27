@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.1.8";
+  const APP_VERSION = "0.1.9";
   const GITHUB_REPO = "ivister/lighter-explorer";
 
   // ── DOM references ──────────────────────────────────────
@@ -1699,7 +1699,7 @@
     if (t >= 21 && t <= 27) {
       const mo = ev.mo;
       const to = ev.to;
-      const intMkt = ev.m !== undefined ? ev.m : (info.MarketIndex !== undefined ? info.MarketIndex : undefined);
+      const intMkt = info.MarketIndex !== undefined ? info.MarketIndex : (ev.m !== undefined ? ev.m : undefined);
       const viewerAcct = tx.account_index;
 
       if (mo || to) {
